@@ -1,0 +1,15 @@
+numpy>=1.16.0
+scipy
+matplotlib>=3.1.0
+pandas>=0.15.0
+anndata
+scanpy
+requests
+gseapy
+h5py
+adjustText
+loompy
+future
+leidenalg
+harmonypy
+scrublet
