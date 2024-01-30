@@ -1,24 +1,32 @@
-import os
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 import matplotlib.colors as mcol
-import matplotlib.cm as cm
+
+from matplotlib.collections import PathCollection
+from matplotlib.lines import Line2D
+
+from matplotlib.backends.backend_pdf import PdfPages
+import cmocean
 import seaborn as sns
 import pandas as pd
 import numpy as np
 from future.utils import string_types
-from itertools import cycle
 import functools
 import warnings
 import re
-import scanpy as sc
-import scanpy.plotting._anndata as scp
-import scanpy.plotting._tools as scpt
-from adjustText import adjust_text
-from datetime import datetime
 
-from .helpers import markers_to_df
+from adjustText import adjust_text
+import textalloc
+from datetime import datetime
+from itertools import groupby
+from pandas.api.types import is_numeric_dtype
+import time
+
+from ..helpers import markers_to_df, find_cells_from_coords
+from ..process import expression_data_frame
+
+from .helpers import color_cycle, category_colors, get_numerical_and_annotation_columns
 
 import logging
 logger = logging.getLogger(__name__)
@@ -30,36 +38,23 @@ except (ModuleNotFoundError, OSError) as e:
     logger.debug("Cannot load polarity: {}".format(e))
     with_polarity = False
 
-cm_grey_blue = mcol.LinearSegmentedColormap.from_list("GreyBlue", ["#D3D3D3","#0026F5"])
-plt.register_cmap(name='GreyBlue', cmap=cm_grey_blue)
-
-
-def color_cycle(colors=None):
-    if colors is None:
-        colors = [
-            "#0000ff", "#dc143c", "#00fa9a", "#8b008b", "#f0e68c", "#ff8c00", "#ffc0cb", 
-            "#adff2f", 
-
-            "#2f4f4f", "#556b2f", "#a0522d", "#2e8b57", "#800000", "#191970",
-            "#708090", "#d2691e", "#9acd32",
-            "#20b2aa", "#cd5c5c", "#32cd32", "#8fbc8f", "#b03060", "#9932cc", "#ff0000",
-            "#ffd700", "#0000cd", "#00ff00", "#e9967a", "#00ffff",
-            "#00bfff", "#9370db", "#a020f0", "#ff6347", "#ff00ff", "#1e90ff",
-            "#ffff54", "#dda0dd", "#87ceeb", "#ff1493", "#ee82ee", "#98fb98", "#7fffd4",
-            "#ffe4b5", "#ff69b4", "#dcdcdc", "#228b22", "#bc8f8f", "#4682b4", "#000080", 
-            "#808000", "#b8860b", 
-        ]
-    elif isinstance(colors, string_types):
-        try:
-            colors = plt.get_cmap(colors).colors
-        except ValueError:
-            colors = [colors]
-
-    colors = cycle(colors)
-    return colors
-
 
 def scenic_regulon_enrichment_heatmap(regulon_enrichment_df, ax=None, **kwargs):
+    return tf_activity_enrichment_heatmap(
+        regulon_enrichment_df, 
+        ax=ax, 
+        tf_column='regulon', 
+        **kwargs
+    )
+
+
+def tf_activity_enrichment_heatmap(
+    tf_activity_enrichment_df, 
+    ax=None, 
+    tf_column='tf', 
+    remove_directionality=False, 
+    **kwargs
+):
     if ax is None:
         ax = plt.gca()
         
@@ -75,8 +70,9 @@ def scenic_regulon_enrichment_heatmap(regulon_enrichment_df, ax=None, **kwargs):
     kwargs.setdefault('vmin', -1.5)
     kwargs.setdefault('vmax', 1.5)
     
-    regulon_enrichment_df['regulon'] = list(map(lambda s: s[:-3], regulon_enrichment_df.regulon))
-    df_heatmap = pd.pivot_table(data=regulon_enrichment_df, index='group', columns='regulon', values='Z')
+    tf_activity_enrichment_df.loc[:, tf_column] = list(map(lambda s: s[:-3] if remove_directionality else s, 
+                                                       tf_activity_enrichment_df[tf_column]))
+    df_heatmap = pd.pivot_table(data=tf_activity_enrichment_df, index='group', columns=tf_column, values='Z')
 
     sns.heatmap(df_heatmap, ax=ax, **kwargs)
     ax.set_ylabel('')
@@ -84,16 +80,78 @@ def scenic_regulon_enrichment_heatmap(regulon_enrichment_df, ax=None, **kwargs):
     return ax
 
 
-def scenic_binarised_plot(adata_sub, groups, figsize=(20, 90), colors=None, 
-                          obsm_key=None, binarise=True, palette=None,
-                          activity_support_cutoff=None, min_cells_active=0,
-                          **kwargs):
+def scenic_binarised_plot_old(adata_sub, groups, figsize=(20, 90), colors=None, 
+                              obsm_key=None, binarise=True, palette=None,
+                              activity_support_cutoff=None, min_cells_active=0,
+                              **kwargs):
     if obsm_key is None:
         obsm_key = 'X_aucell_mean' if not binarise else 'X_aucell_bin'
     
     data = pd.DataFrame(data=adata_sub.obsm[obsm_key], index=adata_sub.obs.index,
                         columns=adata_sub.uns['regulons'])
     
+    return _scenic_binarised_plot_from_df(adata_sub, data, groups, figsize, colors=colors,
+                                          binarise=binarise, palette=palette,
+                                          activity_support_cutoff=activity_support_cutoff,
+                                          min_cells_active=min_cells_active,
+                                          **kwargs)
+
+
+def scenic_binarised_plot(
+    vdata, 
+    groups, 
+    figsize=(20, 90), 
+    key_prefix='scenic',
+    layer='aucell_positive_sum', 
+    colors=None, 
+    binarise=True, 
+    palette=None,
+    activity_support_cutoff=None, 
+    min_cells_active=0,
+    view_key=None,
+    **kwargs
+):
+    if not layer.startswith(key_prefix):
+        layer = f'{key_prefix}_{layer}'
+    
+    vdata_sub = vdata.copy(only_constraints=True)
+    vdata_sub.add_index_var_constraint(
+        [
+            v for v, is_regulon in zip(
+                vdata.var(view_key=view_key).index, 
+                vdata.var(view_key=view_key)[f'{key_prefix}_is_regulon']
+            )
+            if is_regulon
+        ]
+    )
+    
+    data = pd.DataFrame(
+        data=vdata_sub.layers(view_key=view_key)[layer].toarray(), 
+        index=vdata_sub.obs(view_key=view_key).index,
+        columns=vdata_sub.var(view_key=view_key).index
+    )
+    
+    return _scenic_binarised_plot_from_df(vdata, data, groups, figsize, colors=colors,
+                                          binarise=binarise, palette=palette,
+                                          activity_support_cutoff=activity_support_cutoff,
+                                          min_cells_active=min_cells_active,
+                                          view_key=view_key,
+                                          **kwargs)
+
+
+def _scenic_binarised_plot_from_df(
+    vdata,
+    data, 
+    groups, 
+    figsize=(20, 90), 
+    colors=None, 
+    binarise=True, 
+    palette=None,
+    activity_support_cutoff=None, 
+    min_cells_active=0,
+    view_key=None,
+    **kwargs
+):
     if activity_support_cutoff is not None:
         valid_columns = []
         for column in data.columns:
@@ -104,18 +162,21 @@ def scenic_binarised_plot(adata_sub, groups, figsize=(20, 90), colors=None,
     # N_COLORS = len(adata_sub.obs[group].dtype.categories)
     COLORS = [color['color'] for color in matplotlib.rcParams["axes.prop_cycle"]]
 
-    group_colors = pd.DataFrame(index=adata_sub.obs.index)
+    group_colors = pd.DataFrame(index=vdata.obs(view_key=view_key).index)
     for group in groups:
-        if colors is None or colors.get(group, None) is None:
-            c = dict(zip(adata_sub.obs[group].dtype.categories, COLORS))
-        else:
-            c = colors[group]
-        # cell_type_color_lut = dict(zip(adata.obs.cell_type.dtype.categories, adata.uns['cell_type_colors']))
-        cell_id2cell_type_lut = adata_sub.obs[group].to_dict()
-        print(data)
-        print(data.index)
-        #print(cell_id2cell_type_lut)
-        group_colors[group] = data.index.map(cell_id2cell_type_lut).map(c)
+        try:
+            default_colors = vdata.default_colors(group)
+        except KeyError:
+            default_colors = None
+        
+        colors_dict = category_colors(
+            vdata.obs(view_key=view_key)[group].dtype.categories,
+            colors = None if colors is None else colors.get(group, None),
+            default_colors=default_colors
+        )
+
+        cell_id2cell_type_lut = vdata.obs(view_key=view_key)[group].to_dict()
+        group_colors[group] = data.index.map(cell_id2cell_type_lut).map(colors_dict)
 
     if palette is None:
         palette = sns.xkcd_palette(["white", "black"]) if binarise else 'Reds'
@@ -136,15 +197,82 @@ def scenic_binarised_plot(adata_sub, groups, figsize=(20, 90), colors=None,
     return g.fig
 
 
-def embedding_plot(adata, key, colorby=None, 
-                   groups=None, groupby=None,
-                   splitby=None, split_groups=None,
-                   colors=None, shuffle=True, shuffle_seed=42,
-                   ax=None, cax=None, fig=None, n_cols=2,
-                   lax=None, legend=True, legend_inside=False, groups_rename=None,
-                   simple_axes=True, exclude_nan=False, legend_kwargs={}, 
-                   colorbar_title='', label_groups=False, 
-                   title=None, **kwargs):
+def scenic_target_gene_support_histograms(
+    vdata, 
+    output_file, 
+    key_prefix='scenic', 
+    varm_key='target_gene_support_positive',
+    view_key=None,
+):
+    if not varm_key.startswith(key_prefix):
+        varm_key = f'{key_prefix}_{varm_key}'
+    
+    regulons = [
+        v for v, is_regulon in zip(
+            vdata.var(view_key=view_key).index, 
+            vdata.var(view_key=view_key)[f'{key_prefix}_is_regulon']
+        )
+        if is_regulon
+    ]
+    target_gene_confidence = vdata.varm(view_key=view_key)[varm_key]
+    n_runs = vdata.uns(view_key=view_key)['scenic'][key_prefix]['n_runs']
+    
+    with PdfPages(output_file) as pdf:
+        for regulon in sorted(regulons):
+            regulon_tg_support = pd.Series(
+                target_gene_confidence[
+                    :, 
+                    vdata.var(view_key=view_key).index.get_loc(regulon)
+                ].toarray().ravel(),
+                index=vdata.var(view_key=view_key).index
+            )
+            
+            fig, ax = plt.subplots(figsize=(10, 10))
+            bins = list(range(1, n_runs + 2))
+            ax.hist(regulon_tg_support[regulon_tg_support > 0], bins=bins, align='left')
+            # ax.set_xticks([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+            # ax.set_xticklabels([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+            ax.set_xticks(list(range(1, n_runs + 1)))
+            ax.set_xticklabels(list(range(1, n_runs + 1)))
+            ax.set_ylabel("Number of (putative) target genes")
+            ax.set_xlabel("Number of SCENIC runs supporting target gene")
+            ax.set_title(regulon)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+def embedding_plot(
+    adata, 
+    key, 
+    colorby=None, 
+    groups=None, 
+    groupby=None,
+    splitby=None, 
+    split_groups=None,
+    colors=None, 
+    shuffle=True, 
+    shuffle_seed=42,
+    ax=None, 
+    cax=None, 
+    fig=None, 
+    n_cols=2,
+    lax=None, 
+    legend=True, 
+    legend_inside=False, 
+    groups_rename=None,
+    simple_axes=True, 
+    exclude_nan=False, 
+    nan_color='#cccccc',
+    legend_kwargs={}, 
+    show_colorbar=True, 
+    colorbar_title='', 
+    label_groups=False,
+    title=None, 
+    view_key=None, 
+    layer=None, 
+    dimensions=(0, 1),
+    **kwargs
+):
     if fig is None:
         fig = plt.gcf()
     
@@ -152,20 +280,27 @@ def embedding_plot(adata, key, colorby=None,
         if split_groups is None:
             split_groups = adata.obs[splitby].dtype.categories
         
-        if not isinstance(colorby, list) and not isinstance(colorby, tuple):
+        if not isinstance(colorby, (list, tuple)):
             colorby = [colorby]
-        
+
         max_xlim = None
         max_ylim = None
         axes = []
-        n_rows = max(1, int(np.ceil(len(colorby) * len(split_groups) / n_cols)))
+        if len(colorby) * len(split_groups) == 1:
+            n_rows = 1
+            n_cols = 1
+        else:
+            n_rows = max(1, int(np.ceil(len(colorby) * len(split_groups) / n_cols)))
+        
         gs = GridSpec(n_rows, n_cols)
+        plot_ix = 0
         for i, split_group in enumerate(split_groups):
-            cadata_split = adata.copy()
-            cadata_split.add_categorical_constraint(splitby, split_group)
+            cadata_split = adata.copy(only_constraints=True)
+            cadata_split.add_categorical_obs_constraint(splitby, split_group)
             
             for j, cb in enumerate(colorby):
-                plot_ix = (i * len(colorby) + j)
+                #plot_ix = (i * len(colorby) + j)
+                #plot_ix = (j * len(splitby) + i)
                 row = int(plot_ix / n_cols)
                 col = int(plot_ix % n_cols)
 
@@ -175,8 +310,10 @@ def embedding_plot(adata, key, colorby=None,
                                ax=ax, cax=cax, fig=fig, n_cols=n_cols,
                                lax=lax, legend=legend, legend_inside=legend_inside,
                                groups_rename=groups_rename, simple_axes=simple_axes,
-                               exclude_nan=exclude_nan, legend_kwargs=legend_kwargs,
+                               exclude_nan=exclude_nan, nan_color=nan_color,
+                               legend_kwargs=legend_kwargs,
                                colorbar_title=colorbar_title, label_groups=label_groups,
+                               view_key=view_key, show_colorbar=show_colorbar, layer=layer,
                                **kwargs)
                 if title is None:
                     ax.set_title(f'{split_group} - {cb}')
@@ -195,6 +332,8 @@ def embedding_plot(adata, key, colorby=None,
                     max_ylim[0] = min(max_ylim[0], ylim[0])
                     max_ylim[1] = max(max_ylim[1], ylim[1])
                 axes.append(ax)
+                
+                plot_ix += 1
         
         for ax in axes:
             ax.set_xlim(max_xlim)
@@ -202,7 +341,11 @@ def embedding_plot(adata, key, colorby=None,
         return fig
     
     if isinstance(colorby, list) or isinstance(colorby, tuple):
-        n_rows = int(np.ceil(len(colorby)/n_cols))
+        if len(colorby) == 1:
+            n_cols = 1
+            n_rows = 1
+        else:
+            n_rows = int(np.ceil(len(colorby)/n_cols))
         gs = GridSpec(n_rows, n_cols)
         for i, cb in enumerate(colorby):
             row = int(i / n_cols)
@@ -213,8 +356,10 @@ def embedding_plot(adata, key, colorby=None,
                            ax=ax, cax=cax, fig=fig, n_cols=n_cols,
                            lax=lax, legend=legend, legend_inside=legend_inside,
                            groups_rename=groups_rename, simple_axes=simple_axes,
-                           exclude_nan=exclude_nan, legend_kwargs=legend_kwargs,
+                           exclude_nan=exclude_nan, nan_color=nan_color,
+                           legend_kwargs=legend_kwargs,
                            colorbar_title=colorbar_title, label_groups=label_groups,
+                           view_key=view_key, show_colorbar=show_colorbar, layer=layer,
                            **kwargs)
         return fig
     
@@ -229,40 +374,50 @@ def embedding_plot(adata, key, colorby=None,
     if ax is None:
         ax = fig.gca()
     
-    if (colorby is not None and colorby in adata.obs_keys() 
-        and adata.obs[colorby].dtype.name == 'category'):
-            groupby = colorby
-            colorby = None
+    obs = adata.obs if view_key is None else adata.obs(view_key)
+    obsm = adata.obsm if view_key is None else adata.obsm(view_key)
+    
+    try:
+        if (isinstance(colorby, str) and colorby in obs.columns
+            and obs[colorby].dtype.name == 'category'):
+                groupby = colorby
+                colorby = None
+    except ValueError:
+        pass
 
     if groups_rename is None:
         groups_rename = dict()
 
-    if key not in adata.obsm:
+    if key not in obsm:
         key = 'X_{}'.format(key)
         
     logger.debug("UMAP PREP: {}s".format((datetime.now() - checkpoint).total_seconds()))
     checkpoint = datetime.now()
 
-    coords = adata.obsm[key]
+    coords = obsm[key]
     valid_ixs = np.isfinite(coords[:, 0])
     valid_group_info = None
     if groupby is not None:
-        group_info = adata.obs[groupby].to_numpy(dtype='str')
+        group_info = obs[groupby].to_numpy(dtype='str')
         if exclude_nan:
             valid_ixs = np.logical_and(valid_ixs, group_info != 'nan')
         else:
             group_info[group_info == 'nan'] = 'NA'
         valid_group_info = group_info[valid_ixs]
 
-        all_groups = np.unique(valid_group_info)
+        all_groups = list(np.unique(valid_group_info))
         if groups is None:
             groups = all_groups
         elif isinstance(groups, string_types):
             groups = [groups]
+        else:
+            groups = list(groups)
+        
+        if not exclude_nan and 'NA' not in groups:
+            groups.append('NA')
 
-        if groups is not None:
-            valid_ixs = np.logical_and(valid_ixs, np.isin(group_info, list(groups)))
-            valid_group_info = group_info[valid_ixs]
+        valid_ixs = np.logical_and(valid_ixs, np.isin(group_info, list(groups)))
+        valid_group_info = group_info[valid_ixs]
     valid_coords = coords[valid_ixs]
 
     logger.debug("UMAP COORDS: {}s".format((datetime.now() - checkpoint).total_seconds()))
@@ -276,26 +431,28 @@ def embedding_plot(adata, key, colorby=None,
                 colors = adata.default_colors(groupby)
             except KeyError:
                 pass
-        
+
         if not isinstance(colors, dict):
-            colors = color_cycle(colors)
+            color_cycler = color_cycle(colors)
             dict_group_colors = dict()
             if groups is None:
-                dict_group_colors['all'] = next(colors)
+                dict_group_colors['all'] = next(color_cycler)
             else:
                 for group in groups:
-                    dict_group_colors[group] = next(colors)
+                    dict_group_colors[group] = next(color_cycler)
             colors = dict_group_colors
+        
+        colors['NA'] = nan_color
 
         legend_elements = []
         if groups is None:
-            color = colors['all']
+            color = colors.get('all', '#aaaaaa')
             valid_colors = [matplotlib.colors.to_rgba(color) for _ in range(valid_coords.shape[0])]
         else:
             valid_colors = [None for _ in range(valid_coords.shape[0])]
             legend_elements = []
             for group in groups:
-                color = matplotlib.colors.to_rgba(colors[group])
+                color = matplotlib.colors.to_rgba(colors.get(group, '#aaaaaa'))
                 ixs = np.argwhere(valid_group_info == group)[:, 0]
                 for ix in ixs:
                     valid_colors[ix] = color
@@ -304,7 +461,7 @@ def embedding_plot(adata, key, colorby=None,
                     label = groups_rename.get(group, group)
                     legend_elements.append(matplotlib.patches.Patch(facecolor=color, edgecolor=color,
                                            label=label))
-            if title is None:
+            if title is None and groupby is not None:
                 ax.set_title(groupby.replace('_', ' '))
         valid_colors = np.array(valid_colors)
     else:
@@ -314,11 +471,23 @@ def embedding_plot(adata, key, colorby=None,
             cmap = 'viridis'
         else:
             cmap = colors
+        
+        if isinstance(cmap, str):
+            if cmap in cmocean.cm.cmapnames:
+                cmap = getattr(cmocean.cm, cmap)
+            else:
+                cmap = matplotlib.colormaps[cmap]
+        
+        if not exclude_nan:
+            cmap.set_bad(nan_color)
 
         if isinstance(colorby, string_types):
             try:
                 checkpoint = datetime.now()
-                feature_values = adata.values(colorby)[valid_ixs]
+                try:
+                    feature_values = adata.obs_vector(colorby, view_key=view_key, layer=layer)[valid_ixs]
+                except TypeError:
+                    feature_values = adata.obs_vector(colorby, layer=layer)[valid_ixs]
                 #feature_values = adata.adata[:, colorby].X.toarray()[:, 0]
                 logger.debug("UMAP END VALUES: {}s".format((datetime.now() - checkpoint).total_seconds()))
                 checkpoint = datetime.now()
@@ -350,7 +519,14 @@ def embedding_plot(adata, key, colorby=None,
     logger.debug("UMAP SHUFFLE: {}s".format((datetime.now() - checkpoint).total_seconds()))
     checkpoint = datetime.now()
 
-    plot = ax.scatter(valid_coords[:, 0], valid_coords[:, 1], c=valid_colors, cmap=cmap, **kwargs)
+    plot = ax.scatter(
+        valid_coords[:, dimensions[0]], 
+        valid_coords[:, dimensions[1]], 
+        c=valid_colors, 
+        cmap=cmap, 
+        plotnonfinite=not exclude_nan, 
+        **kwargs
+    )
     
     logger.debug("UMAP PLOT: {}s".format((datetime.now() - checkpoint).total_seconds()))
     checkpoint = datetime.now()
@@ -369,7 +545,7 @@ def embedding_plot(adata, key, colorby=None,
                 lax.legend(handles=legend_elements, **legend_kwargs)
             else:
                 lax.legend(handles=legend_elements, **lax_kwargs)
-        elif colorby is not None:
+        elif colorby is not None and show_colorbar:
             if cax is not None:
                 cb = plt.colorbar(plot, cax=cax)
             else:
@@ -392,9 +568,9 @@ def embedding_plot(adata, key, colorby=None,
     axis_label = key
     if axis_label.startswith('X_'):
         axis_label = axis_label[2:]
-    m = re.match(r'__subset__(.+)__(.+)', axis_label)
+    m = re.match(r'(__subset__|__view__)(.+)__(X_)?(.+)', axis_label)
     if m is not None:
-        axis_label = '{}'.format(m.group(2).upper())
+        axis_label = '{}'.format(m.group(4).upper())
     else:
         axis_label = axis_label.upper()
     #axis_label = key.upper() if not key.startswith('X_') else key[2:].upper()
@@ -415,613 +591,6 @@ def embedding_plot(adata, key, colorby=None,
     logger.debug("UMAP TOTAL: {}s".format((datetime.now() - start).total_seconds()))
 
     return ax
-
-
-def _colorbar_ax(fig, subplot_spec, max_cbar_height: float = 4.0):
-    width, height = fig.get_size_inches()
-    if height > max_cbar_height:
-        # to make the colorbar shorter, the
-        # ax is split and the lower portion is used.
-        axs2 = GridSpecFromSubplotSpec(
-            2,
-            1,
-            subplot_spec=subplot_spec,
-            height_ratios=[height - max_cbar_height, max_cbar_height],
-        )
-        heatmap_cbar_ax = fig.add_subplot(axs2[1])
-    else:
-        heatmap_cbar_ax = fig.add_subplot(subplot_spec)
-
-    return heatmap_cbar_ax
-
-
-def markers_heatmap(
-        adata: scp.AnnData,
-        var_names: scp.Union[scp._VarNames, scp.Mapping[str, scp._VarNames]],
-        groupby: scp.Union[str, scp.Sequence[str]],
-        use_raw: scp.Optional[bool] = None,
-        log: bool = False,
-        scale_and_center: bool = False,
-        num_categories: int = 7,
-        dendrogram: scp.Union[bool, str] = False,
-        gene_symbols: scp.Optional[str] = None,
-        var_group_positions: scp.Optional[scp.Sequence[scp.Tuple[int, int]]] = None,
-        var_group_labels: scp.Optional[scp.Sequence[str]] = None,
-        var_group_rotation: scp.Optional[float] = None,
-        layer: scp.Optional[str] = None,
-        standard_scale: scp.Optional[scp.Literal['var', 'obs']] = None,
-        swap_axes: bool = False,
-        show_gene_labels: scp.Optional[bool] = None,
-        groups: scpt.Union[str, scpt.Sequence[str]] = None,
-        show: scp.Optional[bool] = None,
-        save: scp.Union[str, bool, None] = None,
-        figsize: scp.Optional[scp.Tuple[float, float]] = None,
-        axes: scp.Union[matplotlib.axes._axes.Axes] = None,
-        colors: scp.Union[str, list, None] = None,
-        **kwds,
-):
-    """\
-    Heatmap of the expression values of genes.
-    If `groupby` is given, the heatmap is ordered by the respective group. For
-    example, a list of marker genes can be plotted, ordered by clustering. If
-    the `groupby` observation annotation is not categorical the observation
-    annotation is turned into a categorical by binning the data into the number
-    specified in `num_categories`.
-    Parameters
-    ----------
-    {common_plot_args}
-    standard_scale
-        Whether or not to standardize that dimension between 0 and 1, meaning for each variable or observation,
-        subtract the minimum and divide each by its maximum.
-    swap_axes
-         By default, the x axis contains `var_names` (e.g. genes) and the y axis the `groupby`
-         categories (if any). By setting `swap_axes` then x are the `groupby` categories and y the `var_names`.
-    show_gene_labels
-         By default gene labels are shown when there are 50 or less genes. Otherwise the labels are removed.
-    {show_save_ax}
-    axes
-        Matplotlib axes for (in this order): heatmap, colorbar, dendrogram, groups, genes
-    **kwds
-        Are passed to :func:`matplotlib.pyplot.imshow`.
-    Returns
-    -------
-    List of :class:`~matplotlib.axes.Axes`
-    Examples
-    -------
-    >>> import scanpy as sc
-    >>> adata = sc.datasets.pbmc68k_reduced()
-    >>> markers = ['C1QA', 'PSAP', 'CD79A', 'CD79B', 'CST3', 'LYZ']
-    >>> sc.pl.heatmap(adata, markers, groupby='bulk_labels', dendrogram=True, swap_axes=True)
-    Using var_names as dict:
-    >>> markers = {{'T-cell': 'CD3D', 'B-cell': 'CD79A', 'myeloid': 'CST3'}}
-    >>> sc.pl.heatmap(adata, markers, groupby='bulk_labels', dendrogram=True)
-    See also
-    --------
-    rank_genes_groups_heatmap: to plot marker genes identified using the :func:`~scanpy.tl.rank_genes_groups` function.
-    """
-    if use_raw is None and adata.raw is not None:
-        use_raw = True
-
-    var_names, var_group_labels, var_group_positions = scp._check_var_names_type(
-        var_names, var_group_labels, var_group_positions
-    )
-
-    categories, obs_tidy = scp._prepare_dataframe(
-        adata,
-        var_names,
-        groupby,
-        use_raw,
-        log,
-        num_categories,
-        gene_symbols=gene_symbols,
-        layer=layer,
-    )
-
-    if scale_and_center:
-        centered = obs_tidy.subtract(obs_tidy.mean(axis=0), axis=1)
-        scaled = centered.div(np.nanstd(centered, axis=0), axis=1)
-        obs_tidy = scaled
-
-    if groups is not None:
-        ixs = [g in set(groups) for g in obs_tidy.index]
-        obs_tidy = obs_tidy[ixs]
-        obs_tidy.index = obs_tidy.index.set_categories(groups)
-        categories = np.unique(obs_tidy.index)
-
-    if standard_scale == 'obs':
-        obs_tidy = obs_tidy.sub(obs_tidy.min(1), axis=0)
-        obs_tidy = obs_tidy.div(obs_tidy.max(1), axis=0).fillna(0)
-    elif standard_scale == 'var':
-        obs_tidy -= obs_tidy.min(0)
-        obs_tidy = (obs_tidy / obs_tidy.max(0)).fillna(0)
-    elif standard_scale is None:
-        pass
-    else:
-        scp.logg.warning('Unknown type for standard_scale, ignored')
-
-    if groupby is None or len(categories) <= 1:
-        categorical = False
-        # dendrogram can only be computed  between groupby categories
-        dendrogram = False
-    else:
-        categorical = True
-        # get categories colors:
-        if colors is None:
-            if groupby + "_colors" in adata.uns:
-                colors = adata.uns[groupby + "_colors"]
-            else:
-                colors = color_cycle(colors)
-
-        if groups is None:
-            groups = np.unique(adata.obs[groupby])
-        
-        if isinstance(colors, dict):
-            groupby_colors = [colors.get(g) for g in groups]
-        else:
-            groupby_colors = [next(colors) for _ in range(len(groups))]
-    
-    print('----->', groupby_colors)
-
-    if dendrogram:
-        dendro_data = scp._reorder_categories_after_dendrogram(
-            adata,
-            groupby,
-            dendrogram,
-            var_names=var_names,
-            var_group_labels=var_group_labels,
-            var_group_positions=var_group_positions,
-            categories=categories,
-        )
-
-        var_group_labels = dendro_data['var_group_labels']
-        var_group_positions = dendro_data['var_group_positions']
-
-        # reorder obs_tidy
-        if dendro_data['var_names_idx_ordered'] is not None:
-            obs_tidy = obs_tidy.iloc[:, dendro_data['var_names_idx_ordered']]
-            var_names = [var_names[x] for x in dendro_data['var_names_idx_ordered']]
-
-        obs_tidy.index = obs_tidy.index.reorder_categories(
-            [categories[x] for x in dendro_data['categories_idx_ordered']],
-            ordered=True,
-        )
-
-        # reorder groupby colors
-        if groupby_colors is not None:
-            groupby_colors = [
-                groupby_colors[x] for x in dendro_data['categories_idx_ordered']
-            ]
-
-    if show_gene_labels is None:
-        if len(var_names) <= 50:
-            show_gene_labels = True
-        else:
-            show_gene_labels = False
-            scp.logg.warning(
-                'Gene labels are not shown when more than 50 genes are visualized. '
-                'To show gene labels set `show_gene_labels=True`'
-            )
-    if categorical:
-        obs_tidy = obs_tidy.sort_index()
-
-    colorbar_width = 0.2
-
-    if not swap_axes:
-        # define a layout of 2 rows x 4 columns
-        # first row is for 'brackets' (if no brackets needed, the height of this row is zero)
-        # second row is for main content. This second row is divided into three axes:
-        #   first ax is for the categories defined by `groupby`
-        #   second ax is for the heatmap
-        #   third ax is for the dendrogram
-        #   fourth ax is for colorbar
-
-        dendro_width = 1 if dendrogram else 0
-        groupby_width = 0.2 if categorical else 0
-        if figsize is None:
-            height = 6
-            if show_gene_labels:
-                heatmap_width = len(var_names) * 0.3
-            else:
-                heatmap_width = 8
-            width = heatmap_width + dendro_width + groupby_width
-        else:
-            width, height = figsize
-            heatmap_width = width - (dendro_width + groupby_width)
-
-        if var_group_positions is not None and len(var_group_positions) > 0:
-            # add some space in case 'brackets' want to be plotted on top of the image
-            height_ratios = [0.15, height]
-        else:
-            height_ratios = [0, height]
-
-        width_ratios = [
-            groupby_width,
-            heatmap_width,
-            dendro_width,
-            colorbar_width,
-        ]
-
-        if axes is None or isinstance(axes, matplotlib.gridspec.SubplotSpec):
-            fig = scp.pl.figure(figsize=(width, height))
-
-            if isinstance(axes, matplotlib.gridspec.SubplotSpec) or isinstance(axes, matplotlib.gridspec.GridSpec):
-                axs = scp.gridspec.GridSpecFromSubplotSpec(
-                    nrows=2,
-                    ncols=4,
-                    width_ratios=width_ratios,
-                    wspace=0.15 / width,
-                    hspace=0.13 / height,
-                    height_ratios=height_ratios,
-                    subplot_spec=axes
-                )
-            else:
-                axs = scp.gridspec.GridSpec(
-                    nrows=2,
-                    ncols=4,
-                    width_ratios=width_ratios,
-                    wspace=0.15 / width,
-                    hspace=0.13 / height,
-                    height_ratios=height_ratios,
-                )
-
-            heatmap_ax = fig.add_subplot(axs[1, 1])
-            colorbar_ax = _colorbar_ax(fig, axs[1, 3])
-            groupby_ax = fig.add_subplot(axs[1, 0]) if categorical else None
-            dendro_ax = fig.add_subplot(axs[1, 2], sharey=heatmap_ax) if dendrogram else None
-            gene_groups_ax = fig.add_subplot(axs[0, 1], sharex=heatmap_ax) if var_group_positions is not None and \
-                                                                              len(var_group_positions) > 0 else None
-        else:
-            if isinstance(axes, matplotlib.axes._axes.Axes):
-                axes = [axes]
-            heatmap_ax = axes[0]
-            colorbar_ax = axes[1] if len(axes) > 1 else None
-            dendro_ax = axes[2] if len(axes) > 2 else None
-            groupby_ax = axes[3] if len(axes) > 3 else None
-            gene_groups_ax = axes[4] if len(axes) > 4 else None
-
-        kwds.setdefault('interpolation', 'nearest')
-        im = heatmap_ax.imshow(obs_tidy.values, aspect='auto', **kwds)
-
-        heatmap_ax.set_ylim(obs_tidy.shape[0] - 0.5, -0.5)
-        heatmap_ax.set_xlim(-0.5, obs_tidy.shape[1] - 0.5)
-        heatmap_ax.tick_params(axis='y', left=False, labelleft=False)
-        heatmap_ax.set_ylabel('')
-        heatmap_ax.grid(False)
-
-        # sns.heatmap(obs_tidy, yticklabels="auto", ax=heatmap_ax, cbar_ax=heatmap_cbar_ax, **kwds)
-        if show_gene_labels:
-            heatmap_ax.tick_params(axis='x', labelsize='small')
-            heatmap_ax.set_xticks(np.arange(len(var_names)))
-            heatmap_ax.set_xticklabels(var_names, rotation=90)
-        else:
-            heatmap_ax.tick_params(axis='x', labelbottom=False, bottom=False)
-
-        # plot colorbar
-        if colorbar_ax is not None:
-            plt.colorbar(im, cax=colorbar_ax)
-
-        if categorical and groupby_ax is not None:
-            try:
-                ticks, labels, groupby_cmap, norm = scp._plot_categories_as_colorblocks(
-                    groupby_ax, obs_tidy, colors=groupby_colors, orientation='left'
-                )
-            except ValueError:
-                label2code, ticks, labels, groupby_cmap, norm = scp._plot_categories_as_colorblocks(
-                    groupby_ax, obs_tidy, colors=groupby_colors, orientation='left'
-                )
-
-            # add lines to main heatmap
-            line_positions = (
-                    np.cumsum(obs_tidy.index.value_counts(sort=False))[:-1] - 0.5
-            )
-            heatmap_ax.hlines(
-                line_positions,
-                -0.73,
-                len(var_names) - 0.5,
-                lw=0.6,
-                zorder=10,
-                clip_on=False,
-            )
-
-        if dendrogram and dendro_ax is not None:
-            scp._plot_dendrogram(
-                dendro_ax, adata, groupby, ticks=ticks, dendrogram_key=dendrogram,
-            )
-
-        # plot group legends on top of heatmap_ax (if given)
-        if var_group_positions is not None and len(var_group_positions) > 0 and gene_groups_ax is not None:
-            scp._plot_gene_groups_brackets(
-                gene_groups_ax,
-                group_positions=var_group_positions,
-                group_labels=var_group_labels,
-                rotation=var_group_rotation,
-                left_adjustment=-0.3,
-                right_adjustment=0.3,
-            )
-
-    # swap axes case
-    else:
-        # define a layout of 3 rows x 3 columns
-        # The first row is for the dendrogram (if not dendrogram height is zero)
-        # second row is for main content. This col is divided into three axes:
-        #   first ax is for the heatmap
-        #   second ax is for 'brackets' if any (othwerise width is zero)
-        #   third ax is for colorbar
-
-        dendro_height = 0.8 if dendrogram else 0
-        groupby_height = 0.13 if categorical else 0
-        if figsize is None:
-            if show_gene_labels:
-                heatmap_height = len(var_names) * 0.18
-            else:
-                heatmap_height = 4
-            width = 10
-            height = heatmap_height + dendro_height + groupby_height
-        else:
-            width, height = figsize
-            heatmap_height = height - (dendro_height + groupby_height)
-
-        height_ratios = [dendro_height, heatmap_height, groupby_height]
-
-        if var_group_positions is not None and len(var_group_positions) > 0:
-            # add some space in case 'brackets' want to be plotted on top of the image
-            width_ratios = [width, 0.14, colorbar_width]
-        else:
-            width_ratios = [width, 0, colorbar_width]
-
-        if axes is None or isinstance(axes, matplotlib.gridspec.SubplotSpec):
-            fig = scp.pl.figure(figsize=(width, height))
-
-            if isinstance(axes, matplotlib.gridspec.SubplotSpec) or isinstance(axes, matplotlib.gridspec.GridSpec):
-                axs = scp.gridspec.GridSpecFromSubplotSpec(
-                    nrows=3,
-                    ncols=3,
-                    wspace=0.25 / width,
-                    hspace=0.3 / height,
-                    width_ratios=width_ratios,
-                    height_ratios=height_ratios,
-                    subplot_spec=axes
-                )
-            else:
-                axs = scp.gridspec.GridSpec(
-                    nrows=3,
-                    ncols=3,
-                    wspace=0.25 / width,
-                    hspace=0.3 / height,
-                    width_ratios=width_ratios,
-                    height_ratios=height_ratios,
-                )
-
-            heatmap_ax = fig.add_subplot(axs[1, 0])
-            colorbar_ax = _colorbar_ax(fig, axs[1, 2])
-            groupby_ax = fig.add_subplot(axs[2, 0]) if categorical else None
-            dendro_ax = fig.add_subplot(axs[0, 0], sharey=heatmap_ax) if dendrogram else None
-            gene_groups_ax = fig.add_subplot(axs[1, 1], sharex=heatmap_ax) if var_group_positions is not None and \
-                                                                              len(var_group_positions) > 0 else None
-        else:
-            if isinstance(axes, matplotlib.axes._axes.Axes):
-                axes = [axes]
-            heatmap_ax = axes[0]
-            colorbar_ax = axes[1] if len(axes) > 1 else None
-            dendro_ax = axes[2] if len(axes) > 2 else None
-            groupby_ax = axes[3] if len(axes) > 3 else None
-            gene_groups_ax = axes[4] if len(axes) > 4 else None
-
-        # plot heatmap
-        kwds.setdefault('interpolation', 'nearest')
-        im = heatmap_ax.imshow(obs_tidy.T.values, aspect='auto', **kwds)
-        heatmap_ax.set_xlim(0, obs_tidy.shape[0])
-        heatmap_ax.set_ylim(obs_tidy.shape[1] - 0.5, -0.5)
-        heatmap_ax.tick_params(axis='x', bottom=False, labelbottom=False)
-        heatmap_ax.set_xlabel('')
-        heatmap_ax.grid(False)
-        if show_gene_labels:
-            heatmap_ax.tick_params(axis='y', labelsize='small', length=1)
-            heatmap_ax.set_yticks(np.arange(len(var_names)))
-            heatmap_ax.set_yticklabels(var_names, rotation=0)
-        else:
-            heatmap_ax.tick_params(axis='y', labelleft=False, left=False)
-
-        if categorical and groupby_ax is not None:
-            ticks, labels, groupby_cmap, norm = scp._plot_categories_as_colorblocks(
-                groupby_ax, obs_tidy, colors=groupby_colors, orientation='bottom',
-            )
-            # add lines to main heatmap
-            line_positions = (
-                    np.cumsum(obs_tidy.index.value_counts(sort=False))[:-1] - 0.5
-            )
-            heatmap_ax.vlines(
-                line_positions,
-                -0.5,
-                len(var_names) + 0.35,
-                lw=0.6,
-                zorder=10,
-                clip_on=False,
-            )
-
-        if dendrogram and dendro_ax is not None:
-            scp._plot_dendrogram(
-                dendro_ax,
-                adata,
-                groupby,
-                dendrogram_key=dendrogram,
-                ticks=ticks,
-                orientation='top',
-            )
-
-        # plot group legends next to the heatmap_ax (if given)
-        if var_group_positions is not None and len(var_group_positions) > 0 and gene_groups_ax is not None:
-            arr = []
-            for idx, pos in enumerate(var_group_positions):
-                arr += [idx] * (pos[1] + 1 - pos[0])
-
-            gene_groups_ax.imshow(
-                np.matrix(arr).T, aspect='auto', cmap=groupby_cmap, norm=norm
-            )
-            gene_groups_ax.axis('off')
-
-        # plot colorbar
-        if colorbar_ax is not None:
-            plt.colorbar(im, cax=colorbar_ax)
-
-    return_ax_dict = {'heatmap_ax': heatmap_ax}
-    if categorical:
-        return_ax_dict['groupby_ax'] = groupby_ax
-    if dendrogram:
-        return_ax_dict['dendrogram_ax'] = dendro_ax
-    if var_group_positions is not None and len(var_group_positions) > 0:
-        return_ax_dict['gene_groups_ax'] = gene_groups_ax
-
-    return return_ax_dict
-
-
-def _rank_genes_groups_plot(
-    adata: scpt.AnnData,
-    plot_type: str = 'heatmap',
-    groups: scpt.Union[str, scpt.Sequence[str]] = None,
-    n_genes: int = 10,
-    groupby: scpt.Optional[str] = None,
-    values_to_plot: scpt.Optional[str] = None,
-    min_logfoldchange: scpt.Optional[float] = None,
-    key: scpt.Optional[str] = None,
-    show: scpt.Optional[bool] = None,
-    save: scpt.Optional[bool] = None,
-    return_fig: scpt.Optional[bool] = False,
-    **kwds,
-):
-    """\
-    Common function to call the different rank_genes_groups_* plots
-    """
-    if key is None:
-        key = 'rank_genes_groups'
-
-    if groupby is None:
-        groupby = str(adata.uns[key]['params']['groupby'])
-    group_names = adata.uns[key]['names'].dtype.names if groups is None else groups
-
-    var_names = {}  # dict in which each group is the key and the n_genes are the values
-    gene_names = []
-    for group in group_names:
-        if min_logfoldchange is not None:
-            df = sc.get.rank_genes_groups_df(adata, group, key=key)
-            # select genes with given log_fold change
-            genes_list = df[df.logfoldchanges > min_logfoldchange].names.tolist()[
-                :n_genes
-            ]
-        else:
-            # get all genes that are 'non-nan'
-            genes_list = [
-                gene for gene in adata.uns[key]['names'][group] if not pd.isnull(gene)
-            ][:n_genes]
-
-        if len(genes_list) == 0:
-            scpt.logg.warning(f'No genes found for group {group}')
-            continue
-        var_names[group] = genes_list
-        gene_names.extend(genes_list)
-
-    # by default add dendrogram to plots
-    kwds.setdefault('dendrogram', True)
-
-    if plot_type in ['dotplot', 'matrixplot']:
-        # these two types of plots can also
-        # show score, logfoldchange and pvalues, in general any value from rank
-        # genes groups
-        title = None
-        values_df = None
-        if values_to_plot is not None:
-            values_df = scpt._get_values_to_plot(adata, values_to_plot, gene_names, key=key)
-            title = values_to_plot
-
-        if plot_type == 'dotplot':
-            from scanpy.plotting import dotplot
-
-            _pl = dotplot(
-                adata,
-                var_names,
-                groupby,
-                dot_color_df=values_df,
-                return_fig=True,
-                **kwds,
-            )
-
-            if title is not None:
-                _pl.legend(colorbar_title=title.replace("_", " "))
-        elif plot_type == 'matrixplot':
-            from scanpy.plotting import matrixplot
-
-            _pl = matrixplot(
-                adata, var_names, groupby, values_df=values_df, return_fig=True, **kwds
-            )
-
-            if title is not None:
-                _pl.legend(title=title.replace("_", " "))
-
-        return scpt._fig_show_save_or_axes(_pl, return_fig, show, save)
-
-    elif plot_type == 'stacked_violin':
-        from scanpy.plotting import stacked_violin
-
-        _pl = stacked_violin(adata, var_names, groupby, return_fig=True, **kwds)
-        return scpt._fig_show_save_or_axes(_pl, return_fig, show, save)
-
-    elif plot_type == 'heatmap':
-        return markers_heatmap(adata, var_names, groupby, groups=group_names, show=show, save=save, **kwds)
-
-    elif plot_type == 'tracksplot':
-        from scanpy.plotting import tracksplot
-
-        return tracksplot(adata, var_names, groupby, show=show, save=save, **kwds)
-
-
-def rank_genes_groups_heatmap(
-    adata: scpt.AnnData,
-    groups: scpt.Union[str, scpt.Sequence[str]] = None,
-    n_genes: int = 10,
-    groupby: scpt.Optional[str] = None,
-    min_logfoldchange: scpt.Optional[float] = None,
-    key: str = None,
-    show: scpt.Optional[bool] = None,
-    save: scpt.Optional[bool] = None,
-    **kwds,
-):
-    """\
-    Plot ranking of genes using heatmap plot (see :func:`~scanpy.pl.heatmap`)
-    Parameters
-    ----------
-    adata
-        Annotated data matrix.
-    groups
-        The groups for which to show the gene ranking.
-    n_genes
-        Number of genes to show.
-    groupby
-        The key of the observation grouping to consider. By default,
-        the groupby is chosen from the rank genes groups parameter but
-        other groupby options can be used.  It is expected that
-        groupby is a categorical. If groupby is not a categorical observation,
-        it would be subdivided into `num_categories` (see :func:`~scanpy.pl.heatmap`).
-    min_logfoldchange
-        Value to filter genes in groups if their logfoldchange is less than the
-        min_logfoldchange
-    key
-        Key used to store the ranking results in `adata.uns`.
-    **kwds
-        Are passed to :func:`~scanpy.pl.heatmap`.
-    {show_save_ax}
-    """
-    return _rank_genes_groups_plot(
-        adata,
-        plot_type='heatmap',
-        groups=groups,
-        n_genes=n_genes,
-        groupby=groupby,
-        key=key,
-        min_logfoldchange=min_logfoldchange,
-        show=show,
-        save=save,
-        **kwds,
-    )
 
 
 def _p_to_size(p, min_p=1e-3, base_size=40):
@@ -1390,18 +959,39 @@ def cellphonedb_dot_plot(pvalues_files, means_files, sample_names=None,
     return fig
 
 
-def volcano_plot_from_df(df, plot_adjusted_pvalues=False,
-                         label_genes=None, label_top_n=0, min_pvalue=2.096468e-309,
-                         log2fc_cutoff=2, padj_cutoff=1e-10,
-                         exclude_genes_prefix=None, exclude_genes=None, include_genes=None,
-                         insignificant_color='#eeeeee', logfc_color='#fceade', padj_color='#25ced1',
-                         both_color='#ff8a5b', label_top_only_significant=True,
-                         ignore_insignificant_large_z=True,
-                         hide_insignificant_large_z=True, z_artifact_cutoff=15,
-                         x_symmetrical=True, log2fc_field='log2fc', pvalue_field='pval', padj_field='padj',
-                         gene_name_field='name',
-                         label_size='medium',
-                         xlim=None, ylim=None, ax=None, **kwargs):    
+def volcano_plot_from_df(
+    df, plot_adjusted_pvalues=False,
+    label_genes=None, 
+    label_top_n=0, 
+    min_pvalue=2.096468e-309,
+    log2fc_cutoff=2, 
+    padj_cutoff=1e-10,
+    exclude_genes_prefix=None, 
+    exclude_genes=None, 
+    include_genes=None,
+    insignificant_color='#eeeeee', 
+    logfc_color='#fceade', 
+    padj_color='#25ced1',
+    both_color='#ff8a5b',
+    label_line_color='#777777',
+    label_top_only_significant=True,
+    ignore_insignificant_large_z=True,
+    hide_insignificant_large_z=True, 
+    z_artifact_cutoff=15,
+    x_symmetrical=True, 
+    log2fc_field='log2fc', 
+    pvalue_field='pval', 
+    padj_field='padj',
+    gene_name_field='name',
+    label_size=7,
+    adjust_labels=True, 
+    adjust_labels_iterations=50, 
+    adjust_labels_precision=0.01,
+    xlim=None, 
+    ylim=None, 
+    ax=None, 
+    **kwargs
+):
     if ax is None:
         ax = plt.gca()
 
@@ -1494,10 +1084,41 @@ def volcano_plot_from_df(df, plot_adjusted_pvalues=False,
         ax.set_ylim(ylim)
 
     texts = []
+    texts_str = []
     for i, label in enumerate(plot_labels):
-        text = ax.annotate(label, plot_labels_xy[i], fontsize=label_size)
-        texts.append(text)
-    adjust_text(texts, arrowprops=dict(arrowstyle='-', color='grey'), ax=ax, lim=50)
+        #text = ax.annotate(label, plot_labels_xy[i], fontsize=label_size)
+        #texts.append(text)
+        texts_str.append(label)
+    
+    if adjust_labels and len(plot_labels_xy) > 0:
+        start = datetime.now()
+        # adjust_text(
+        #     texts, 
+        #     arrowprops=dict(arrowstyle='-', color='grey'), 
+        #     lim=adjust_labels_iterations,
+        #     precision=adjust_labels_precision,
+        #     ax=ax
+        # )
+        
+        xy = np.array(plot_labels_xy)
+        textalloc.allocate_text(
+            ax.figure,
+            ax,
+            xy[:, 0],
+            xy[:, 1],
+            texts_str,
+            # x_scatter=xy[:, 0],
+            # y_scatter=xy[:, 1],
+            max_distance=0.2,
+            min_distance=0.01,
+            margin=0.0009,
+            # linewidth=0.5,
+            linecolor=label_line_color,
+            nbr_candidates=400,
+            textsize=label_size,
+        )
+        end = datetime.now()
+        print(f'took: {(end - start).total_seconds()}')
 
     ax.set_xlabel("Log2-fold change expression")
     ax.set_ylabel("-log10(adjusted p-value)" if plot_adjusted_pvalues else "-log10(p-value)")
@@ -1519,28 +1140,211 @@ def volcano_plot(adata, key, group, ax=None, **kwargs):
     return volcano_plot_from_df(df, **kwargs)
 
 
+def violin_plot_data(
+    vdata, 
+    feature,
+    groupby=None,
+    groups=None,
+    groups_rename=None,
+    ignore_groups=('NA',),
+    splitby=None, 
+    split_groups=None, 
+    split_rename=None, 
+    value_key=None,
+    layer=None, 
+):
+    vdata = vdata.copy(only_constraints=True)
+    
+    value_key = value_key or feature
+    
+    data = pd.DataFrame.from_dict({
+        value_key: vdata.obs_vector(feature, layer=layer),
+    })
+    
+    if groupby is not None:
+        data['group'] = pd.Categorical(vdata.obs[groupby])
+    
+    if splitby is not None:
+        data['split'] = pd.Categorical(vdata.obs[splitby])
+    
+    if ignore_groups is not None and 'group' in data:
+        data = data.loc[~data['group'].isin(ignore_groups), :]
+    
+    if groups is not None and 'group' in data:
+        data = data.loc[data['group'].isin(groups), :]
+    
+    if split_groups is not None and 'split' in data:
+        data = data.loc[data['split'].isin(split_groups), :]
+    
+    if groupby is not None:
+        groups = groups or pd.Categorical(data['group'].to_list()).dtype.categories
+    
+    if splitby is not None:
+        split_groups = split_groups or pd.Categorical(data['split'].to_list()).dtype.categories
+    
+    if groups_rename is not None:
+        data['group'] = pd.Categorical(
+            [groups_rename.get(g, g) for g in data['group']],
+            categories=[groups_rename[g] for g in groups]
+        )
+    else:
+        if 'group' in data:
+            data['group'] = pd.Categorical(data['group'], categories=groups)
+    
+    if split_rename is not None:
+        data['split'] = pd.Categorical(
+            [split_rename.get(g, g) for g in data['split']],
+            categories=[split_rename[g] for g in split_groups]
+        )
+    else:
+        if 'split' in data:
+            data['split'] = pd.Categorical(data['split'], categories=split_groups)
+    
+    return data
+
+
+def violin_plot_from_df(
+    df,
+    colors=None,
+    scale='width',
+    legend=False, 
+    legend_inside=True,
+    ylim=None, 
+    swarm=True, 
+    points_size=2, 
+    points_color='black', 
+    points_alpha=0.4, 
+    points_jitter=0.25,
+    shuffle_seed=42,
+    ax=None, 
+    lax=None, 
+    legend_kwargs={},
+    value_key=None,
+    group_key='group',
+    split_key='split',
+    **kwargs
+):
+    ax = ax or plt.gca()
+    #lax = lax or ax
+    value_key = value_key or df.columns[0]
+    
+    x = None
+    order = None
+    hue = None
+    hue_order = None
+    palette = None
+    legend_elements = []
+    legend_order = None
+    
+    if group_key in df:
+        x = group_key
+        order = df[group_key].dtype.categories
+        palette = category_colors(order, colors)
+        #palette = [palette_dict.get(category, '#777777') for category in order]
+        legend_order = order
+    
+    if split_key in df:
+        hue = split_key
+        hue_order = list(df[split_key].dtype.categories)
+        palette = category_colors(hue_order, colors)
+        legend_order = hue_order
+        if x is None:
+            df = df.copy()
+            df['__x'] = ""
+            x = '__x'
+
+    ax = sns.violinplot(
+        x=x,
+        y=value_key,
+        hue=hue, 
+        scale=scale,
+        data=df, 
+        split=True, 
+        order=order,
+        hue_order=hue_order,
+        palette=palette, 
+        ax=ax, 
+        **kwargs
+    )
+    if swarm:
+        np.random.seed(shuffle_seed)
+        ax = sns.stripplot(
+            x=x, 
+            y=value_key, 
+            hue=hue,
+            data=df, 
+            dodge=True, 
+            order=order, 
+            hue_order=hue_order,
+            color=points_color, 
+            alpha=points_alpha,
+            jitter=points_jitter,
+            size=points_size,
+            ax=ax, 
+            **kwargs
+        )
+        
+    ax.set_xticklabels([label.get_text() for label in ax.get_xticklabels()], rotation=90)
+    ax.set_xlabel("")
+    ax.set_ylabel(value_key)
+
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    
+    # legend
+    if legend_order is not None:
+        for category in legend_order:
+            legend_elements.append(
+                matplotlib.patches.Patch(
+                    facecolor=palette[category], 
+                    edgecolor=palette[category],
+                    label=category
+                )
+            )
+            
+    if legend and len(legend_elements) > 1:
+        if lax is None:
+            lax = ax
+            lax_kwargs = dict(bbox_to_anchor=(1.01, 1), loc='upper left')
+        else:
+            lax_kwargs = dict(loc='center', labelspacing=2, frameon=False)
+            lax.axis('off')
+
+        lax_kwargs.update(legend_kwargs)
+        if legend_inside:
+            lax.legend(handles=legend_elements, **legend_kwargs)
+        else:
+            lax.legend(handles=legend_elements, **lax_kwargs)
+    
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    return ax
+
+
 def violin_plot(cadata, feature,
                 groupby=None, groups=None, groups_rename={}, colors=None,
                 splitby=None, split_groups=None, split_rename={}, 
-                scale='width', legend=False, ax=None, fig=None,
+                scale='width', 
+                legend=False, legend_inside=True,
                 ylim=None, swarm=True, 
                 ignore_groups=('NA',),
                 layer=None, 
                 points_size=2, points_color='black', points_alpha=0.4, 
                 points_jitter=0.25,
                 shuffle_seed=42,
+                ax=None, lax=None, legend_kwargs={},
                 **kwargs):
-    if fig is None:
-        fig = plt.gcf()
-    
     if ax is None:
-        ax = fig.gca()
+        ax = plt.gca()
+    
+    cadata = cadata.copy(only_constraints=True)
 
     if groupby is not None:
         if groups is None:
             groups = cadata.obs[groupby].dtype.categories
         else:
-            cadata.add_categorical_constraint(groupby, groups)
+            cadata.add_categorical_obs_constraint(groupby, groups)
         groups = [groups_rename.get(g, g) for g in groups if g not in ignore_groups]
 
         if splitby is None:
@@ -1567,7 +1371,7 @@ def violin_plot(cadata, feature,
         if split_groups is None:
             split_groups = cadata.obs[splitby].dtype.categories
         else:
-            cadata.add_categorical_constraint(splitby, split_groups)
+            cadata.add_categorical_obs_constraint(splitby, split_groups)
             
         if len(split_groups) != 2:
             raise ValueError(f"Can only split if the number of split_groups ({len(split_groups)}) is exactly 2!")
@@ -1598,7 +1402,7 @@ def violin_plot(cadata, feature,
     if kwargs.get('inner') == 'swarm':
         kwargs.pop('inner')
 
-    values = cadata.values(feature, layer=layer)
+    values = cadata.obs_vector(feature, layer=layer)
     if splitby is not None and groupby is not None:
         df_groups = [groups_rename.get(g, g) for g in cadata.obs[groupby]]
         df_splits = [split_rename.get(s, s) for s in cadata.obs[splitby]]
@@ -1687,8 +1491,36 @@ def violin_plot(cadata, feature,
                                **kwargs)
     ax.set_ylim((np.min(values), np.max(values)))
 
-    if not legend and ax.get_legend() is not None:
+    if legend:
+        handles, labels = ax.get_legend_handles_labels()
+        
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        
+        if splitby is not None and swarm:
+            handles = handles[0:int(len(handles)/2)]
+            labels = labels[0:int(len(labels)/2)]
+        
+        if lax is None:
+            lax = ax
+            lax_kwargs = dict(bbox_to_anchor=(1.01, 1), loc='upper left')
+        else:
+            lax_kwargs = dict(loc='center', labelspacing=2, frameon=False)
+            lax.axis('off')
+
+        lax_kwargs.update(legend_kwargs)
+        if legend_inside:
+            print("adding legend inside", handles, labels)
+            lax.legend(handles, labels, **legend_kwargs)
+        else:
+            print("adding legend", handles, labels)
+            lax.legend(handles, labels, **lax_kwargs)
+    elif ax.get_legend() is not None:
         ax.get_legend().remove()
+    # elif splitby is not None and swarm:
+    #     handles, labels = ax.get_legend_handles_labels()
+    #     ax.legend(handles[0:int(len(handles)/2)], labels[0:int(len(handles)/2)], 
+    #                 bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
 
     ax.set_xticklabels([label.get_text() for label in ax.get_xticklabels()], rotation=90)
     ax.set_xlabel("")
@@ -1699,25 +1531,236 @@ def violin_plot(cadata, feature,
 
     return ax
 
+#
+# CPDB dot plot
+#
+def _p_to_size(p, min_p=1e-3, max_p=0.1, min_size=1, base_size=40, scale=1., _verbose=False):
+    p = max(min_p, p)
+    if p > max_p:
+        return min_size
+    lp = -np.log10(p)
+    size = (lp + 1) ** scale * base_size
+    if _verbose:
+        print(f'p: {p}, lp: {lp}, size: {size}')
+    return size
+
+
+def cpdb_dot_plot_dfs(
+    dfs, 
+    filter_dfs=None,
+    base_marker_size=10, 
+    marker_scale=2, 
+    min_pvalue=1e-3, 
+    max_pvalue=0.1,
+):
+    if not isinstance(dfs, (tuple, list)):
+        dfs = [dfs]
+    
+    df_dots = []
+    for df in dfs:
+
+        df_dot = pd.DataFrame({
+            'lr': [f'{l}--{r}' for l, r in zip(df['ligand'], df['receptor'])],
+            'ct': [f'{lct}--{rct}' for lct, rct in zip(df['ligand_celltype'], df['receptor_celltype'])],
+            'pvalue': df['pvalue'],
+            'inv_pvalue': 1-df['pvalue'],
+            'mean': df['mean'],
+            'size': [_p_to_size(p, base_size=base_marker_size, scale=marker_scale,
+                                min_p=min_pvalue, max_p=max_pvalue) 
+                    for p in df['pvalue']]
+        })
+        
+        if filter_dfs is not None:
+            if not isinstance(filter_dfs, (list, tuple)):
+                if isinstance(filter_dfs, dict):
+                    filter_dfs = list(filter_dfs.values())
+                else:
+                    filter_dfs = [filter_dfs]
+            
+            valid_lr = set()
+            valid_ct = set()
+            for fdf in filter_dfs:
+                valid_lr = valid_lr.union(set([f'{l}--{r}' for l, r in zip(fdf['ligand'], fdf['receptor'])]))
+                valid_ct = valid_ct.union(set([f'{lct}--{rct}' 
+                                for lct, rct in zip(fdf['ligand_celltype'], fdf['receptor_celltype'])]))
+            df_dot = df_dot.loc[np.logical_and(df_dot['lr'].isin(valid_lr), df_dot['ct'].isin(valid_ct)), :]
+        df_dots.append(df_dot)
+
+    return df_dots
+
+
+def cpdb_dot_plot(df, filter_df=None,
+                  base_marker_size=10, marker_scale=2, legend_size=0.03,
+                  min_pvalue=1e-3, max_pvalue=0.1,
+                  min_mean=None, max_mean=None,
+                  ax=None, lax=None, cax=None, 
+                  lrs=None, cts=None,
+                  **kwargs):
+    ax = ax or plt.gca()
+    
+    if not isinstance(df, dict):
+        dfs = {'__all__': df}
+    else:
+        dfs = df
+    
+    df_dots_list = cpdb_dot_plot_dfs(
+        [dfs[name] for name in dfs.keys()], 
+        filter_dfs=filter_df,
+        base_marker_size=base_marker_size, 
+        marker_scale=marker_scale, 
+        min_pvalue=min_pvalue, 
+        max_pvalue=max_pvalue,
+    )
+    df_dots = {name: df_dots_list[i] for i, name in enumerate(dfs.keys())}
+    
+    return cpdb_dot_plot_from_prepared(
+        df_dots, 
+        base_marker_size=base_marker_size, 
+        marker_scale=marker_scale, 
+        legend_size=legend_size,
+        min_pvalue=min_pvalue, 
+        max_pvalue=max_pvalue,
+        min_mean=min_mean, 
+        max_mean=max_mean,
+        lrs=lrs,
+        cts=cts,
+        ax=ax, 
+        lax=lax, 
+        cax=cax, 
+        **kwargs
+    )
+
+
+def cpdb_dot_plot_from_prepared(
+    df_dots, 
+    base_marker_size=10, 
+    marker_scale=2, 
+    legend_size=0.03,
+    min_pvalue=1e-3, 
+    max_pvalue=0.1,
+    min_mean=None, 
+    max_mean=None,
+    ax=None, 
+    lax=None, 
+    cax=None,
+    lrs=None,
+    cts=None,
+    **kwargs
+):
+    ax = ax or plt.gca()
+    
+    if lrs is None or cts is None:
+        lrs_all = []
+        cts_all = []
+        for df_dot in df_dots.values():
+            lrs_all += df_dot['lr'].to_list()
+            cts_all += df_dot['ct'].to_list()
+        lrs = lrs or sorted(np.unique(lrs_all))
+        cts = cts or sorted(np.unique(cts_all))
+    
+    lr_ixs = {lr: i for i, lr in enumerate(lrs)}
+    ct_ixs = {ct: i for i, ct in enumerate(cts)}
+    
+    n_dfs = len(df_dots)
+    offset = {0: 0}
+    if n_dfs == 2:
+        offset = {0: -0.15, 1: 0.15}
+    elif n_dfs == 3:
+        offset = {0: -0.3, 1: 0, 2: 0.3}
+    elif n_dfs == 4:
+        offset = {0: -0.3, 1: -0.1, 2: 0.1, 3: 0.3}
+    elif n_dfs > 4:
+        raise ValueError("Cannot currently compare more than 4 samples.")
+    
+    for i, (name, df_dot) in enumerate(df_dots.items()):
+        x = [ct_ixs[ct] + offset[i] for ct in df_dot['ct']]
+        y = [lr_ixs[lr] for lr in df_dot['lr']]
+        
+        kwargs.setdefault('vmin', min_mean)
+        kwargs.setdefault('vmax', max_mean)
+        plot_data = ax.scatter(x, y, s=df_dot['size'], c=df_dot['mean'], **kwargs)
+        
+        if n_dfs > 1:
+            labels = [name] * len(x)
+            secax = ax.secondary_xaxis('top')
+            secax.set_xticks(x)
+            secax.set_xticklabels(labels, rotation=90)
+    
+    ax.set_xticks(range(len(cts)))
+    ax.set_yticks(range(len(lrs)))
+    ax.set_xticklabels(cts)
+    ax.set_yticklabels(lrs)
+    ax.set_ylim((-1, len(lrs)))
+    ax.set_xlim((-1, len(cts)))
+    # default_size_norm = matplotlib.colors.Normalize(vmin=0.9, vmax=0.999)
+    # kwargs.setdefault('size_norm', default_size_norm)
+    # sns.scatterplot(data=df_dot, x='ct', y='lr', size='size', hue='mean', ax=ax, **kwargs)
+    ax.tick_params(axis='x', labelrotation = 90)
+    
+    # colorbar
+    cax = cax or ax.inset_axes([1 + legend_size, 0.5, legend_size, 0.5])
+    cb = plt.colorbar(plot_data, ax=ax, cax=cax)
+    cb.set_label('Mean L+R\nexpression')
+    # legend
+    lax = lax or ax.inset_axes([1 + legend_size * 1.7, 0 + legend_size, legend_size, 0.5])
+    legend_elements = []
+    for p in [1e-3, 1e-2, 1e-1, 1]:
+        e = plt.Line2D([0], [0], marker='o', color='black', label='{}'.format(p),
+                       markerfacecolor='black', 
+                       markersize=np.sqrt(_p_to_size(p, base_size=base_marker_size, 
+                                                     scale=marker_scale, 
+                                                     min_p=min_pvalue, max_p=max_pvalue,
+                                                     _verbose=True)),
+                       linewidth=0)
+        legend_elements.append(e)
+    lax.legend(handles=legend_elements, loc='upper left', labelspacing=2, frameon=False,
+               title='P-value')
+    lax.axis('off')
+    
+    return ax
+
 
 #
 # LR plot Circos-style
 #
 def cpdb_ligand_receptor_circos(cpdb_df, celltypes=None, colors=None, 
-                                label_size='xx-small', plot_gene_names=False,
+                                label_size='xx-small', 
+                                plot_gene_names=False,
+                                plot_pathway_labels=True,
+                                group_by_pathway=True,
                                 celltype_label_offset=3.0, pathway_label_offset=1.5,
+                                celltype_label_horizontal=True,
                                 gene_label_offset=1.5, ylim=(0, 15),
                                 inner_radius=10,
-                                ax=None):
+                                alpha_min=0.2, alpha_max=0.9,
+                                invert_opacity=None,
+                                link_opacity_key='mean',
+                                link_opacity_value_range=None,
+                                link_opacity_value_percentiles=(5, 95),
+                                link_color_key=None, link_colors=None, 
+                                link_color_value_range=None,
+                                link_color_value_percentiles=(0, 100),
+                                legend=True, legend_size=0.05, legend_label_size=8,
+                                ax=None, fig=None, lax=None,):
     if not with_polarity:
         raise ValueError("Cannot plot circos, please install polarity first.")
-        
+    
+    if link_opacity_key is not None and link_opacity_key.lower() == 'none':
+        link_opacity_key = None
+    
+    if link_color_key is not None and link_color_key.lower() == 'none':
+        link_color_key = None
+    
+    if invert_opacity is None and link_opacity_key == 'pvalue':
+        invert_opacity = True
+    
     # remove NaNs
     cpdb_df = cpdb_df.copy()
-    cpdb_df['pathway'][cpdb_df['pathway'].isna()] = ''
-    
-    if colors is None:
-        colors = dict()
+    if not group_by_pathway:
+        cpdb_df['pathway'] = 'NA'
+        plot_pathway_labels = False
+    else:
+        cpdb_df.loc[cpdb_df['pathway'].isna(), 'pathway'] = ''
     
     if isinstance(plot_gene_names, set):
         pass
@@ -1731,7 +1774,11 @@ def cpdb_ligand_receptor_circos(cpdb_df, celltypes=None, colors=None,
     pol = polarity.Polarity(inner_radius=inner_radius)
     # set up segments
     if celltypes is None:
-        celltypes = list(set(cpdb_df['ligand_celltype'].unique()).union(set(cpdb_df['receptor_celltype'].unique())))
+        celltypes = sorted(list(set(cpdb_df['ligand_celltype'].unique()).union(set(cpdb_df['receptor_celltype'].unique()))))
+    
+    if not isinstance(colors, dict):
+        cycle_colors = color_cycle(colors)
+        colors = {ct: next(cycle_colors) for ct in celltypes}
     
     ct_segments = dict()
     pathway_segments = dict()
@@ -1741,7 +1788,7 @@ def cpdb_ligand_receptor_circos(cpdb_df, celltypes=None, colors=None,
         pol.add_segment(ct_segment)
         ct_segment_label = polarity.LabelSegment(label=ct, size=ct_segment, 
                                                  radius_offset=celltype_label_offset, fontweight='bold',
-                                                 fontsize=label_size)
+                                                 fontsize=label_size, horizontal=celltype_label_horizontal)
         pol.add_segment(ct_segment_label)
         
         ct_segments[ct] = ct_segment
@@ -1765,11 +1812,12 @@ def cpdb_ligand_receptor_circos(cpdb_df, celltypes=None, colors=None,
                 gene_segments[ct][pathway] = dict()
                 
                 pathway_segment = polarity.Segment(size=count/total, radians_padding=0.01)
-                pathway_segment_label = polarity.LabelSegment(label=pathway if pathway != 'NA' and pathway != '' else 'other',
-                                                              size=pathway_segment, 
-                                                              radius_offset=pathway_label_offset,
-                                                              fontsize=label_size)
-                pol.add_segment(pathway_segment_label)
+                if plot_pathway_labels:
+                    pathway_segment_label = polarity.LabelSegment(label=pathway if pathway != 'NA' and pathway != '' else 'other',
+                                                                size=pathway_segment, 
+                                                                radius_offset=pathway_label_offset,
+                                                                fontsize=label_size)
+                    pol.add_segment(pathway_segment_label)
                 
                 ct_segment.add_segment(pathway_segment)
                 pathway_segments[ct][pathway] = pathway_segment
@@ -1810,21 +1858,453 @@ def cpdb_ligand_receptor_circos(cpdb_df, celltypes=None, colors=None,
                                                            fontsize=label_size)
                 pol.add_segment(gene_label_segment)
     
-    min_expression, max_expression = np.nanpercentile(cpdb_df['mean'], [5, 95])
+    min_link_color_value, max_link_color_value = None, None
+    if link_color_key is not None:
+        if link_color_value_range is None:
+            min_link_color_value, max_link_color_value = np.nanpercentile(cpdb_df[link_color_key], link_color_value_percentiles)
+        else:
+            min_link_color_value, max_link_color_value = link_color_value_range
+    
+    min_link_opacity_value, max_link_opacity_value = None, None
+    if link_opacity_key is not None:
+        if link_opacity_value_range is None:
+            min_link_opacity_value, max_link_opacity_value = np.nanpercentile(cpdb_df[link_opacity_key], link_opacity_value_percentiles)
+        else:
+            min_link_opacity_value, max_link_opacity_value = link_opacity_value_range
+
+    if link_color_key is not None:
+        try:
+            link_colors = matplotlib.cm.get_cmap(link_colors)
+            has_link_cmap = True
+        except ValueError:
+            link_color = link_colors
+            link_colors = {}
+    elif link_colors is not None:
+        link_color = link_colors
+        link_colors = {}
+    else:
+        link_colors = colors.copy()
+        link_color = "#aaaaaa"
     
     # add links
     for row in cpdb_df.itertuples():
         ligand_segment = gene_segments[row.ligand_celltype][getattr(row, 'pathway', 'NA')][row.ligand]
         receptor_segment = gene_segments[row.receptor_celltype][getattr(row, 'pathway', 'NA')][row.receptor]
         
-        alpha = min(.9, max(0.2, (row.mean - min_expression) / (max_expression - min_expression)))
-        #print(alpha)
+        if link_opacity_key is not None:
+            value = getattr(row, link_opacity_key)
+            if value > max_link_opacity_value:
+                value = max_link_opacity_value
+            elif value < min_link_opacity_value:
+                value = min_link_opacity_value
+            
+            if max_link_opacity_value - min_link_opacity_value > 0:
+                norm_value = (value - min_link_opacity_value) / (max_link_opacity_value - min_link_opacity_value)
+            else:
+                norm_value = 1
+            if invert_opacity:
+                value = 1 - value
+            alpha = alpha_min + (norm_value * (alpha_max - alpha_min))
+        else:
+            alpha = alpha_min
+        
+        if link_color_key is None:
+            color = link_colors.get(row.ligand_celltype, link_color)
+        else:
+            value = getattr(row, link_color_key)
+            if value > max_link_color_value:
+                value = max_link_color_value
+            elif value < min_link_color_value:
+                value = min_link_color_value
+            norm_value = (value - min_link_color_value) / (max_link_color_value - min_link_color_value)
+            
+            color = link_colors(norm_value)
+
         pol.add_link(
             polarity.BezierPatchLink(ligand_segment, receptor_segment, alpha=alpha, 
-                                    facecolor=colors.get(row.ligand_celltype, '#aaaaaa')))
+                                     facecolor=color)
+        )
     
     grid = False
-    ax = pol.plot(show_grid=grid, show_ticks=grid, show_axis=grid, ax=ax)
+    ax = pol.plot(show_grid=grid, show_ticks=grid, show_axis=grid, ax=ax, fig=fig)
     ax.set_ylim(ylim)
     
+    print("LEGEND ARGS", legend, link_color_key, link_opacity_key)
+    if legend and (link_color_key is not None or link_opacity_key is not None):
+        print("ADDING LEGEND")
+        # legend
+        legend_resolution = 20
+        if lax is None:
+            lax = ax.inset_axes([1 - legend_size, 1 - legend_size, legend_size, legend_size])
+        
+        im = None
+        if link_color_key is not None:
+            n_rows = legend_resolution
+            if link_opacity_key is None:
+                n_rows = 5
+            
+            color_array = np.tile(
+                np.linspace(min_link_color_value, max_link_color_value, legend_resolution),
+                n_rows
+            ).reshape((n_rows, legend_resolution)).T
+            im = lax.imshow(color_array, cmap=link_colors, aspect='equal', origin='lower')
+        
+        if link_opacity_key is not None:
+            if im is None:
+                n_rows = 5
+                color_array = []
+                color_array = np.full((n_rows, legend_resolution), 1)
+                tmp_cmap = mcol.LinearSegmentedColormap.from_list("_tmp", [link_color, link_color])
+                im = lax.imshow(color_array, aspect='equal', origin='lower', cmap=tmp_cmap)
+            
+            im_shape = im.get_array().shape
+            alpha_array = np.tile(
+                np.linspace(min_link_opacity_value, max_link_opacity_value, legend_resolution),
+                im_shape[0]
+            ).reshape((im_shape[0], legend_resolution))
+            alpha_array[alpha_array > max_link_opacity_value] = max_link_opacity_value
+            alpha_array[alpha_array < min_link_opacity_value] = min_link_opacity_value
+            alpha_array = (alpha_array - min_link_opacity_value) / (max_link_opacity_value - min_link_opacity_value)
+            alpha_array[np.isnan(alpha_array)] = 1
+            if invert_opacity:
+                alpha_array = 1 - alpha_array
+            alpha_array = alpha_min + (alpha_array * (alpha_max - alpha_min))
+            
+            im.set_alpha(alpha_array)
+        
+        if link_color_key is not None:
+            lax.set_yticks([0, im.get_array().shape[0]])
+            lax.set_yticklabels([round(min_link_color_value, 2), round(max_link_color_value, 2)])
+            lax.set_ylabel(link_color_key)
+        else:
+            lax.set_yticks([])
+            
+        if link_opacity_key is not None:
+            lax.set_xticks([0, im.get_array().shape[1]])
+            lax.set_xticklabels([round(min_link_opacity_value, 2), round(max_link_opacity_value, 2)])
+            lax.set_xlabel(link_opacity_key)
+        else:
+            lax.set_xticks([])
+
+        for l in lax.get_xticklabels() + lax.get_yticklabels():
+            l.set_fontsize(legend_label_size)
+
     return ax
+
+
+def count_groups_plot(counts_df, ax=None, split_order=None, group_order=None,
+                      colors=None, horizontal=True, groups_rename=None,
+                      relative=False, add_percentages=False,
+                      legend=True, legend_inside=True, lax=None, 
+                      legend_kwargs={},
+                      **kwargs):
+    if ax is None:
+        ax = plt.gca()
+
+    if groups_rename is None:
+        groups_rename = dict()
+
+    relative_df = (counts_df.T / counts_df.sum(axis=1)).T
+
+    if relative:
+        counts_df = relative_df
+
+    if group_order is None:
+        group_order = list(counts_df.columns)
+    
+    if split_order is None:
+        if counts_df.shape[0] != 1 or counts_df.index[0] != 'count':
+            split_order = list(counts_df.index)
+
+    rowsums = np.zeros(len(group_order))
+    
+    colors = category_colors(
+        categories=split_order or group_order,
+        colors=colors,
+    )
+    
+    xticks = np.arange(0, len(group_order))
+    if split_order is not None:
+        for index in split_order:
+            try:
+                row = counts_df.loc[index]
+            except KeyError:
+                values = [0 for _ in group_order]
+                continue
+            values = []
+            for g_ix, g in enumerate(group_order):
+                try:
+                    values.append(row[g])
+                except KeyError:
+                    values.append(0)
+
+            label = groups_rename.get(index, index)
+
+            if horizontal:
+                ax.barh(xticks, values, left=rowsums, label=label, color=colors[index], **kwargs)
+            else:
+                ax.bar(xticks, values, bottom=rowsums, label=label, color=colors[index], **kwargs)
+            rowsums += values
+    else:
+        values = counts_df.loc['count']
+        for i, (x, value, group) in enumerate(zip(xticks, values, group_order)):
+            label = groups_rename.get(group, group)
+
+            if horizontal:
+                ax.barh([i], [value],  label=label, color=colors[group], **kwargs)
+            else:
+                ax.bar([i], [values], label=label, color=colors[group], **kwargs)
+        rowsums += values
+    
+    if add_percentages:
+        relative_sum = np.sum(counts_df, axis=0)/ np.sum(np.sum(counts_df, axis=0))
+        for g_ix, g in enumerate(group_order):
+            relative_label = relative_sum[g] * 100
+
+            if horizontal:
+                ax.text(rowsums[g_ix], xticks[g_ix], '{:.1f}%'.format(relative_label), verticalalignment='center',
+                fontfamily='sans-serif')
+            else:
+                ax.text(xticks[g_ix], rowsums[g_ix], '{:.1f}%'.format(relative_label), verticalalignment='center',
+                fontfamily='sans-serif')
+            
+            xmax = np.max(rowsums*1.2)
+            ax.set_xlim((0, xmax))
+
+    if legend:
+        if lax is None:
+            lax = ax
+            lax_kwargs = dict(bbox_to_anchor=(1.01, 1), loc='upper left')
+        else:
+            lax_kwargs = dict(loc='center', labelspacing=2, frameon=False)
+            lax.axis('off')
+
+        lax_kwargs.update(legend_kwargs)
+        if legend_inside:
+            lax.legend(**legend_kwargs)
+        else:
+            lax.legend(**lax_kwargs)
+
+    if horizontal:
+        ax.set_yticks(xticks)
+        ax.set_yticklabels([groups_rename.get(g, g) for g in group_order])
+        ax.invert_yaxis()
+    else:
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(group_order)
+    
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    if np.issubdtype(counts_df.to_numpy().dtype, np.integer):
+        ax.set_xlabel("Number of cells")
+    else:
+        if np.max(counts_df.to_numpy()) > 1.:
+            ax.set_xlabel("Percentage of cells")
+        else:
+            ax.set_xlabel("Fraction of cells")
+
+    return ax
+
+
+def cell_picker_embedding_plot(*args, **kwargs):
+    kwargs.setdefault('picker', True)
+    kwargs.setdefault('pickradius', 2)
+    
+    ax = embedding_plot(*args, **kwargs)
+    fig = ax.figure
+    
+    def onpick1(event):
+        if isinstance(event.artist, PathCollection):
+            ind = event.ind
+            data = np.array(event.artist.get_offsets().data)
+            ind = event.ind
+            print('onpick3 scatter:', ind, data[ind])
+
+    fig.canvas.mpl_connect('pick_event', onpick1)
+    return ax
+
+
+
+def expression_heatmap(
+    expression_df, 
+    cmap=None,
+    vmin=None, 
+    vmax=None,
+    annotation_colors=None,
+    annotation_columns=None,
+    label_first_annotation=True,
+    legend=None, 
+    legend_rows=2,
+    colorbar=True,
+    vcenter=None,
+    fig=None
+):
+    if fig is None:
+        fig = plt.gcf()
+    
+    if legend is None:
+        legend_first_annotation = False
+        legend = True
+    elif legend:
+        legend_first_annotation = True
+    else:
+        legend_first_annotation = False
+    
+    numerical_columns, annotation_columns = get_numerical_and_annotation_columns(
+        expression_df, 
+        annotation_columns=annotation_columns
+    )
+    
+    if annotation_colors is None:
+        annotation_colors = {}
+    elif not isinstance(annotation_colors, dict):
+        annotation_colors = {c: annotation_colors for c in annotation_columns}
+    
+    mat = expression_df.loc[:, numerical_columns]
+    
+    # map annotation colors
+    color_mat = []
+    legend_annotation_colors = {}
+    if len(annotation_columns) > 0:
+        for i, annotation_column in enumerate(annotation_columns):
+            color_dict = category_colors(expression_df[annotation_column].unique(),
+                                         colors=annotation_colors.get(annotation_column, None))
+            # default_colors = color_cycle()
+            # annotation_color_dict = annotation_colors.get(annotation_column, {})
+            # color_dict = {}
+            # for category in expression_df[annotation_column].unique():
+            #     try:
+            #         color_dict[category] = annotation_color_dict[category]
+            #     except KeyError:
+            #         color_dict[category] = next(default_colors)
+            annotation_column_colors = [mcol.to_rgb(color_dict[c]) for c in expression_df[annotation_column]]
+            color_mat.append(annotation_column_colors)
+            if i > 0 or legend_first_annotation:
+                legend_annotation_colors[annotation_column] = color_dict
+        
+        color_mat = np.array(color_mat).transpose((1, 0, 2))
+    
+    # heatmap labels
+    heatmap_yticks = []
+    heatmap_yticklabels = []
+    if label_first_annotation and len(annotation_columns) > 0:
+        start = 0
+        for label, group in groupby(expression_df[annotation_columns[0]]):
+            group_size = len(list(group))
+            heatmap_yticks.append(start + int(group_size/2))
+            heatmap_yticklabels.append(label)
+            start += group_size
+
+    n_cols = 2 + int((len(legend_annotation_colors) + 2) / (legend_rows))
+    gs = GridSpec(legend_rows, n_cols, width_ratios=[5*len(annotation_columns), 100] + [20] * (n_cols-2), wspace=0.02)
+    
+    # annotations
+    if len(annotation_columns) > 0:
+        annotation_ax = fig.add_subplot(gs[0:legend_rows, 0])
+        annotation_ax.imshow(color_mat, aspect='auto', interpolation='none')
+        annotation_ax.set_xticks(range(0, len(annotation_columns)))
+        annotation_ax.set_xticklabels(annotation_columns, rotation=90)
+        annotation_ax.set_yticks(heatmap_yticks)
+        annotation_ax.set_yticklabels(heatmap_yticklabels)
+    
+    # norm
+    if vcenter is not None:
+        norm = mcol.TwoSlopeNorm(vcenter=vcenter, vmin=vmin, vmax=vmax)
+    else:
+        norm = mcol.Normalize(vmin=vmin, vmax=vmax)
+    
+    # heatmap
+    heatmap_ax = fig.add_subplot(gs[0:legend_rows, 1])
+    heatmap = heatmap_ax.imshow(mat, aspect='auto', interpolation='none',
+                                cmap=cmap, norm=norm)
+    heatmap_ax.set_xticks(range(0, len(numerical_columns)))
+    heatmap_ax.set_xticklabels(numerical_columns, rotation=90)
+    heatmap_ax.set_yticks([])
+    
+    # colorbar
+    if colorbar:
+        gs_cb = GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[0, 2], width_ratios=[20, 80])
+        cax = fig.add_subplot(gs_cb[0, 0])
+        fig.colorbar(heatmap, cax=cax, orientation='vertical', shrink=0.2)
+    
+    if legend:
+        for i, (annotation_column, colors) in enumerate(legend_annotation_colors.items()):
+            lax =  fig.add_subplot(gs[(i + 1) % legend_rows, 2 + int((i + 1) / legend_rows)])
+            legend_handles = [Line2D([0], [0], color=color, lw=4) for color in colors.values()]
+            legend_labels = list(colors.keys())
+            lax.legend(legend_handles, legend_labels, title=annotation_column,
+                    bbox_to_anchor=(0.05, 1), loc='upper left', borderaxespad=0)
+            lax.axis('off')
+    
+    return fig
+
+
+def markers_expression_heatmap(
+    vdata, 
+    markers, 
+    obs_key,
+    top_n=5,
+    percent_expressed_cutoff=70,
+    log2_fold_change_cutoff=0,
+    abs_log2_fold_change=False,
+    cmap='PiYG',
+    vmin=None,
+    vmax=None,
+    vcenter=None,
+    sort_categories=True,
+    categories_key='group',
+    fig=None,
+):
+    fig = fig or plt.gcf()
+    
+    try:
+        markers = markers.to_pandas()
+    except AttributeError:
+        pass
+
+    if sort_categories:
+        try:
+            markers['_group_int'] = [int(c) for c in markers[categories_key]]
+            sort_column = '_group_int'
+        except ValueError:
+            sort_column = categories_key
+        
+        markers = markers.sort_values(
+            'log2FoldChange', 
+            kind='mergesort', 
+            ascending=False
+        ).sort_values(sort_column, kind='mergesort')
+    
+    if abs_log2_fold_change:
+        log2_fold_change_valid = markers['log2FoldChange'].abs() > log2_fold_change_cutoff
+    else:
+        log2_fold_change_valid = markers['log2FoldChange'] > log2_fold_change_cutoff
+        
+    top_markers = markers[
+        np.logical_and(
+            log2_fold_change_valid,
+            markers['percent_expressed_group'] > percent_expressed_cutoff,
+        )
+    ].groupby(categories_key).head(n=top_n).index.unique()
+
+    clusters = [str(c) for c in sorted(markers[categories_key].unique())]
+    
+    expression_df = expression_data_frame(
+        vdata, 
+        obs_key, 
+        top_markers, 
+        scale=True,
+        obs_order=clusters
+    )
+
+    fig = expression_heatmap(
+        expression_df, 
+        cmap=cmap, 
+        vmin=vmin, 
+        vmax=vmax, 
+        vcenter=vcenter, 
+        fig=fig
+    )
+    
+    return fig
