@@ -31,7 +31,6 @@ setup(
         'cython'
     ],
     packages=find_packages(),
-    #package_data={'fanc': ['test/data/*/*']},
     include_package_data=True,
     install_requires=[
         'numpy>=1.16.0',
@@ -49,9 +48,17 @@ setup(
         'leidenalg',
         'harmonypy',
         'scrublet',
+        'cmocean',
+        'patsy',
+        #'scvi_tools',
+        'pyarrow',
+        'regex',
+        'anndataview',
+        'pydeseq2',
+        'textalloc'
     ],
-    #scripts=['bin/velocity', 'bin/scrna'],
     cmdclass={
         'clean': CleanCommand
     },
+    scripts=['bin/rhapsody-extract-barcode', 'bin/rhapsody-demultiplex'],
 )
