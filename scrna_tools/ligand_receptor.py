@@ -1,58 +1,53 @@
 import pandas as pd
 from pandas.testing import assert_series_equal
 import numpy as np
+import pyarrow.parquet as pq
+import json
 import shutil
 import os
 from .base import ConstrainedAdata
+from ._core import VData
 import subprocess
 from anndata import AnnData
 from .helpers import mkdir, ortholog_converter, to_loom, ortholog_dict
 from .r import r_run
 import tempfile
 from future.utils import string_types
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def cellphonedb(adata, groupby, output_folder, is_log=True,
-                ortholog_file=None,
-                sample_column=None, project_name='project', virtualenv=None):
-    if not isinstance(adata, ConstrainedAdata):
-        cadata = ConstrainedAdata(adata)
+                ortholog_file=None, invert_orthologs=False,
+                lr_annotations_file=None,
+                sample_column=None, project_name='project', virtualenv=None,
+                output_format='parquet'):
+    if not isinstance(adata, VData) and not isinstance(adata, ConstrainedAdata):
+        vdata = VData(adata)
     else:
-        cadata = adata.copy()
+        vdata = adata.copy(only_constraints=True)
 
-    X = cadata.Xarray
+    X = vdata.X.toarray()
     # remove log transform
     if is_log:
         X = np.expm1(X)
 
     # transpose for cellphonedb orientation
     df_expr_matrix = pd.DataFrame(X.T)
-    df_expr_matrix.columns = cadata.obs.index
-    gene_names = cadata.var.index.to_list()
+    df_expr_matrix.columns = vdata.obs.index
+    gene_names = vdata.var.index.to_list()
+    
+    converter = {}
     if ortholog_file is not None:
-        with open(ortholog_file, 'r') as f:
-            human_genes = set()
-            converter = {}
-            for line in f:
-                line = line.rstrip()
-                if line == '':
-                    continue
-
-                old, human = line.split("\t")
-
-                i = 0
-                while human in human_genes:
-                    human = '{}_{}'.format(human, i)
-                    i += 1
-                converter[old] = human
-                human_genes.add(human)
+        converter = ortholog_dict(ortholog_file, invert=invert_orthologs)
         gene_names = [converter.get(g, g) for g in gene_names]
     df_expr_matrix.index = gene_names
 
-    meta_data = {'cell': list(cadata.obs.index),
-                 'cell_type': list(cadata.obs[groupby])}
+    meta_data = {'cell': list(vdata.obs.index),
+                 'cell_type': list(vdata.obs[groupby])}
     if sample_column is not None:
-        meta_data['sample'] = cadata.obs[sample_column]
+        meta_data['sample'] = vdata.obs[sample_column]
     df_meta = pd.DataFrame(data=meta_data)
     df_meta.set_index('cell', inplace=True)
 
@@ -89,6 +84,37 @@ def cellphonedb(adata, groupby, output_folder, is_log=True,
         if tmp_folder is not None:
             shutil.rmtree(tmp_folder)
             pass
+    
+    logger.info("Appending LR and expression info")
+    df = cpdb_to_df(os.path.join(output_folder, project_name, 'pvalues.txt'),
+                    os.path.join(output_folder, project_name, 'means.txt'),
+                    ortholog_file={v: k for k, v in converter.items()} if ortholog_file is not None else None)
+    if lr_annotations_file is not None:
+        df = append_lr_annotations(df, lr_annotations_file)
+    df = append_expression_information(df, vdata.adata_view, groupby)
+
+    if output_format is None or output_format == 'tsv':
+        df.to_csv(os.path.join(output_folder, project_name, 'results.txt'), sep="\t")
+    elif output_format == 'csv':
+        df.to_csv(os.path.join(output_folder, project_name, 'results.txt'), sep=",")
+    elif output_format == 'parquet' or output_format == 'pq':
+        df.to_parquet(os.path.join(output_folder, project_name, 'results.pq'))
+        pqdf = pq.read_table(os.path.join(output_folder, project_name, 'results.pq'))
+        obs_constraints = vdata.constraints if isinstance(vdata, ConstrainedAdata) else [c.to_dict() for c in vdata.obs_constraints]
+        meta = {
+            'analysis': 'CellphoneDB',
+            'groupby': groupby,
+            'constraints': json.dumps(obs_constraints),
+            'project_name': project_name,
+            #'ligands': json.dumps()
+        }
+        pqdf = pqdf.replace_schema_metadata({**pqdf.schema.metadata, 
+                                             **meta})
+        pq.write_table(pqdf, os.path.join(output_folder, project_name, 'results.pq'))
+    else:
+        raise ValueError(f"Unrecognised output format {output_format}")
+    
+    return df
 
 
 def cellphonedb_differential_interactions_between_celltypes(
@@ -180,14 +206,22 @@ def nichenet_ligand_activities(adata, groupby, geneset_of_interest,
             if(!is.element("SeuratDisk", installed_packages)) {{
                 if (!requireNamespace("remotes", quietly = TRUE))
                     install.packages("remotes")
-                remotes::install_github("mojaveazure/seurat-disk")
+                library(remotes)
+                remotes::install_github("mojaveazure/seurat-disk", upgrade="never")
+            }}
+            
+            if(!is.element("ComplexHeatmap", installed_packages)) {{
+                if (!requireNamespace("remotes", quietly = TRUE))
+                    install.packages('remotes')
+                library(remotes)
+                remotes::install_github("jokergoo/ComplexHeatmap", upgrade="never")
             }}
             
             if(!is.element("nichenetr", installed_packages)) {{
-                if (!requireNamespace("devtools", quietly = TRUE))
-                    install.packages('devtools')
-                library(devtools)
-                devtools::install_github("saeyslab/nichenetr")
+                if (!requireNamespace("remotes", quietly = TRUE))
+                    install.packages('remotes')
+                library(remotes)
+                remotes::install_github("saeyslab/nichenetr", upgrade="never")
             }}
             
             library(SeuratDisk)
@@ -262,7 +296,9 @@ def nichenet_ligand_activities(adata, groupby, geneset_of_interest,
 
 
 def _cpdb_matrix_to_df(matrix_file):
-    columns = ['ligand', 'receptor', 'ligand_celltype', 'receptor_celltype', 'secreted', 'integrin', 'value']
+    columns = ['ligand', 'receptor', 'ligand_celltype', 'receptor_celltype', 
+               'secreted', 'integrin', 'ligand_complex', 'receptor_complex',
+               'value']
     data = []
     
     celltype_pairs = None
@@ -279,7 +315,17 @@ def _cpdb_matrix_to_df(matrix_file):
                     celltype_cols[(ct1, ct2)] = col
             else:
                 gene_a, gene_b = fields[4], fields[5]
+                if gene_a == "":
+                    genes = fields[1].split("_")
+                    gene_a = "-".join(genes[:-1])
+                
+                if gene_b == "":
+                    genes = fields[1].split("_")
+                    gene_b = "-".join(genes[1:])
+
                 is_receptor_a, is_receptor_b = fields[7] == 'True', fields[8] == 'True'
+                is_complex_a = fields[2].startswith('complex')
+                is_complex_b = fields[3].startswith('complex')
                 
                 for col in range(11, len(fields)):
                     ix = col - 11
@@ -287,12 +333,15 @@ def _cpdb_matrix_to_df(matrix_file):
                     if is_receptor_a and not is_receptor_b:
                         ligand, receptor = gene_b, gene_a
                         ct2, ct1 = celltype_pairs[ix]
+                        complex_ligand, complex_receptor = is_complex_b, is_complex_a
                     else:
                         ligand, receptor = gene_a, gene_b
                         ct1, ct2 = celltype_pairs[ix]
+                        complex_ligand, complex_receptor = is_complex_a, is_complex_b
                     
                     data.append([ligand, receptor, ct1, ct2, fields[6] == 'True', 
-                                fields[10] == 'True', float(fields[col])])
+                                fields[10] == 'True', complex_ligand, complex_receptor,
+                                float(fields[col])])
     
     df = pd.DataFrame(data, columns=columns)
     return df
@@ -301,7 +350,10 @@ def _cpdb_matrix_to_df(matrix_file):
 def cpdb_to_df(pvalues_file, means_file,
                ortholog_file=None, invert_orthologs=False):
     if ortholog_file is not None:
-        oc = ortholog_dict(ortholog_file, invert=invert_orthologs)
+        if isinstance(ortholog_file, dict):
+            oc = ortholog_file
+        else:
+            oc = ortholog_dict(ortholog_file, invert=invert_orthologs)
     else:
         oc = dict()
     
@@ -315,13 +367,15 @@ def cpdb_to_df(pvalues_file, means_file,
         assert_series_equal(p_df['ligand_celltype'], m_df['ligand_celltype'])
         assert_series_equal(p_df['secreted'], m_df['secreted'])
         assert_series_equal(p_df['integrin'], m_df['integrin'])
+        assert_series_equal(p_df['receptor_complex'], m_df['receptor_complex'])
+        assert_series_equal(p_df['ligand_complex'], m_df['ligand_complex'])
     except AssertionError:
         raise ValueError("pvalues and means file are in different order. This "
                          "could mean that they originate from different analyses!")
     
     df = p_df.copy()
     df['mean'] = m_df['value']
-    df.columns = list(df.columns[:6]) + ['pvalue', 'mean']
+    df.columns = list(df.columns[:8]) + ['pvalue', 'mean']
     
     df['ligand'] = [oc.get(g, g) for g in df['ligand']]
     df['receptor'] = [oc.get(g, g) for g in df['receptor']]
@@ -354,10 +408,10 @@ def append_expression_information(cpdb_df, adata, groupby, groups=None):
     
     ligands = list(cpdb_df['ligand'].unique())
     receptors = list(cpdb_df['receptor'].unique())
-    genes = list(set(ligands).union(set(receptors)))
+    genes = [g for g in list(set(ligands).union(set(receptors))) if g in adata.var_names]
     try:
         genes.remove('')
-    except KeyError:
+    except (KeyError, ValueError):
         pass
     
     gene_expression_by_group = dict()
@@ -386,3 +440,58 @@ def append_expression_information(cpdb_df, adata, groupby, groups=None):
 
     data_df = pd.DataFrame(data, columns=data_columns)
     return pd.concat([cpdb_df, data_df], axis=1)
+
+
+def convert_lr_info_from_lewis_lab_to_table(
+    lewis_lab_csv_file, 
+    output_file,
+    ensembl_to_symbol_file
+):
+    import pandas as pd
+
+    ensembl_to_symbol = {}
+    with open(ensembl_to_symbol_file) as f:
+        for line in f:
+            line = line.rstrip()
+            if line == '':
+                continue
+            ensembl, symbol = line.split("\t")
+            
+            ensembl_to_symbol[ensembl] = symbol
+
+    lr_info = pd.read_csv(lewis_lab_csv_file)
+    receptor_info = []
+    for _, row in lr_info.iterrows():
+        ligand_ensembl = row['ligand_ensembl']
+        try:
+            ligand = ensembl_to_symbol[ligand_ensembl]
+        except KeyError:
+            continue
+        
+        if ligand is None:
+            continue
+        
+        try:
+            for receptor_ensembl in row['receptor_ensembl'].split('&'):
+                try:
+                    receptor = ensembl_to_symbol.get(receptor_ensembl)
+                except KeyError:
+                    continue
+                receptor_info.append(
+                    [
+                        receptor, receptor_ensembl, ligand, 
+                        ligand_ensembl, row['pathway_name'], row['annotation']
+                    ]
+                )
+        except AttributeError:
+            continue
+
+    receptor_info_df = pd.DataFrame(
+        receptor_info, 
+        columns=[
+            'receptor', 'receptor_ensembl', 'ligand', 
+            'ligand_ensembl', 'pathway', 'annotation'
+        ]
+    )
+    receptor_info_df.to_csv(output_file, sep="\t")
+    return receptor_info_df
