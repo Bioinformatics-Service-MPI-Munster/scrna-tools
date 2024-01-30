@@ -9,14 +9,15 @@ from collections import Counter
 import matplotlib.pyplot as plt
 from future.utils import string_types
 
-from .helpers import ortholog_dict, mkdir
+from .helpers import ortholog_dict, mkdir, smart_open
+from.process import relayout
 from .r import scran_size_factors
 
 import logging
 logger = logging.getLogger(__name__)
 
 
-def read_star_data(matrix_mtx_file, barcodes_file, features_file, barcodes_suffix=None):
+def read_star_data(matrix_mtx_file, barcodes_file, features_file, barcodes_suffix=None, use_gene_ids_as_index=False):
 
     if barcodes_suffix is None:
         barcodes_suffix = ''
@@ -27,23 +28,37 @@ def read_star_data(matrix_mtx_file, barcodes_file, features_file, barcodes_suffi
 
     gene_ids = []
     gene_names = []
-    with gzip.open(features_file, mode='r') as ff:
+    with smart_open(features_file, mode='r') as ff:
         for line in ff:
-            line = line.decode('utf-8').rstrip()
+            if isinstance(line, bytes):
+                line = line.decode('utf-8')
+            
+            line = line.rstrip()
             if line == '' or line.startswith("#"):
                 continue
 
             fields = line.split("\t")
             gene_ids.append(fields[0])
-            gene_names.append(fields[1])
+            if len(fields) > 1:
+                gene_names.append(fields[1])
 
-    var = pd.DataFrame(data={'ensembl': gene_ids},
-                       index=gene_names)
-
+    if len(gene_names) == len(gene_ids):
+        if not use_gene_ids_as_index:
+            var = pd.DataFrame(data={'ensembl': gene_ids, 'symbol': gene_names},
+                               index=gene_names)
+        else:
+            var = pd.DataFrame(data={'ensembl': gene_ids, 'symbol': gene_names},
+                               index=gene_ids)
+    else:
+        var = pd.DataFrame(index=gene_ids)
+    
     barcodes = []
-    with gzip.open(barcodes_file, mode='r') as bf:
+    with smart_open(barcodes_file, mode='r') as bf:
         for line in bf:
-            line = line.decode('utf-8').rstrip()
+            if isinstance(line, bytes):
+                line = line.decode('utf-8')
+            
+            line = line.rstrip()
             if line == '' or line.startswith("#"):
                 continue
             barcode = line
@@ -155,6 +170,14 @@ def combined_knee_and_cumulative_count_depth_plot(adata, ax=None, **kwargs):
 
     cumulative_count_depth_plot(adata, ax=ax)
     knee_plot(adata, ax=ax2)
+    
+    fig = ax.figure
+    
+    def onpick1(event):
+        ind = event.ind
+        print('click location:', ind)
+
+    fig.canvas.mpl_connect('pick_event', onpick1)
 
     return ax, ax2
 
@@ -212,8 +235,26 @@ def cell_cycle_genes(mouse_naming_scheme=True, source='tirosh', orthologs=None):
     return s_genes, g2m_genes
 
 
+def activation_score_genes_marsh_et_al(mouse_naming_scheme=True, orthologs=None):
+    if mouse_naming_scheme:
+        genes = ['Fos', 'Junb', 'Zfp36', 'Jun', 'Hspa1a', 'Socs3', 'Rgs1', 'Egr1', 'Btg2', 
+                'Fosb', 'Hist1h1d', 'Ier5', '1500015O10Rik', 'Atf3', 'Hist1h2ac', 
+                'Dusp1', 'Hist1h1e', 'Folr1', 'Serpine1']
+    else:
+        genes = ['FOS', 'JUNB', 'ZFP36', 'JUN', 'HSPA1B', 'SOCS3', 'RGS1', 'EGR1', 'BTG2', 
+                 'FOSB', 'HIST1H1D', 'IER5', '1500015O10Rik', 'ATF3', 'HIST1H2AC', 
+                 'DUSP1', 'HIST1H1E', 'FOLR1', 'SERPINE1']
+        
+    if orthologs is not None:
+        if isinstance(orthologs, string_types):
+            orthologs = ortholog_dict(orthologs)
+
+        genes = [orthologs.get(g, g) for g in genes]
+    return genes
+
+
 def annotate_base_stats(adata, doublets=True, mitochondrial=True, mitochondrial_prefix=None,
-                        cell_cycle=True, genome='mm',
+                        cell_cycle=True, activation_score=True, genome='mm',
                         output_folder=None, prefix=None, orthologs=None):
     if output_folder is not None:
         output_folder = mkdir(output_folder)
@@ -230,7 +271,10 @@ def annotate_base_stats(adata, doublets=True, mitochondrial=True, mitochondrial_
             mitochondrial_prefix = 'MT-'
 
     if doublets:
-        sc.external.pp.scrublet(adata)
+        sc.external.pp.scrublet(
+            adata,
+            n_prin_comps=min(30, adata.shape[0] - 1)
+        )
         #adata.obs['doublet_scores'], adata.obs['predicted_doublets'] = scrub.scrub_doublets()
 
         if output_folder is not None:
@@ -257,14 +301,29 @@ def annotate_base_stats(adata, doublets=True, mitochondrial=True, mitochondrial_
             plt.close(fig)
 
     if cell_cycle:
-        s_genes, g2m_genes = cell_cycle_genes(mouse_naming_scheme=genome.startswith('mm'), orthologs=orthologs)
+        s_genes, g2m_genes = cell_cycle_genes(
+            mouse_naming_scheme=genome.startswith('mm'), 
+            orthologs=orthologs
+        )
         s_genes_mm_ens = adata.var_names[np.in1d(adata.var_names, s_genes)]
         g2m_genes_mm_ens = adata.var_names[np.in1d(adata.var_names, g2m_genes)]
         sc.tl.score_genes_cell_cycle(adata, s_genes=s_genes_mm_ens, g2m_genes=g2m_genes_mm_ens)
+    
+    if activation_score:
+        stress_activation_genes = activation_score_genes_marsh_et_al(
+            mouse_naming_scheme=genome.startswith('mm'), 
+            orthologs=orthologs
+        )
+        stress_activation_genes_ens = adata.var_names[np.in1d(adata.var_names, stress_activation_genes)]
+        sc.tl.score_genes(
+            adata,
+            gene_list=stress_activation_genes_ens,
+            score_name='sc_dissociation_signature_score',
+        )
 
 
 def _optimise_scran_clusters(adata, groups, min_group_size=100, directed=False,
-                             neighbors_key=None, obsp=None):
+                             neighbors_key=None, obsp=None, max_iterations=100):
     adjacency = _choose_graph(adata, obsp, neighbors_key)
     g = get_igraph_from_adjacency(adjacency, directed=directed)
 
@@ -272,7 +331,8 @@ def _optimise_scran_clusters(adata, groups, min_group_size=100, directed=False,
     groups = np.array(list(groups).copy())
     group_counts = Counter(groups)
 
-    while np.min(list(group_counts.values())) < min_group_size:
+    i = 0
+    while np.min(list(group_counts.values())) < min_group_size and i < max_iterations:
         # get smallest group:
         min_group = min(group_counts, key=group_counts.get)
 
@@ -292,37 +352,61 @@ def _optimise_scran_clusters(adata, groups, min_group_size=100, directed=False,
 
         groups[groups == min_group] = best_group
         group_counts = Counter(groups)
+        i += 1
 
     return pd.Series([str(g) for g in groups], index=original_groups.index).astype('category')
 
 
-def scran_norm(adata, min_mean=0.1, layer=None, log=True, resolution=0.5, min_count=100):
+def scran_norm(
+    adata, 
+    min_mean=0.1, 
+    layer=None, 
+    log=True, 
+    resolution=0.5, 
+    min_count=100, 
+    save_raw_counts=None
+):
+    logger.debug("Running scran norm")
+    
+    print('A')
     adata_pp = adata.copy()
     if layer is not None:
         adata_pp.X = adata_pp.layers[layer]
+
+    logger.debug("Scran preprocessing")
+    print('B')
     sc.pp.normalize_per_cell(adata_pp, counts_per_cell_after=1e6)
+    print('B1')
     sc.pp.log1p(adata_pp)
-    sc.pp.pca(adata_pp, n_comps=15)
+    print('B2')
+    sc.pp.pca(adata_pp, n_comps=min(15, adata_pp.shape[0] - 1))
+    print('B3')
     sc.pp.neighbors(adata_pp)
+    print('B4')
     sc.tl.leiden(adata_pp, key_added='groups', resolution=resolution)
+    print('B5')
+    
+    print('C')
+    logger.debug("Scran cluster optimisation")
     adata_pp.obs['groups'] = _optimise_scran_clusters(adata_pp, adata_pp.obs['groups'], min_group_size=min_count)
 
     input_groups = adata_pp.obs['groups']
 
+    print('D')
     logger.info("Number of different groups passed to scran: {}".format(input_groups.dtype.categories))
     if layer is None:
         data_mat = adata.X.toarray().T
     else:
         data_mat = adata.layers[layer].toarray().T
     data_mat = np.array(data_mat, dtype='float32')
-
     size_factors = scran_size_factors(data_mat, input_groups, min_mean=min_mean)
 
     del adata_pp
-
+    
     if layer is None:
-        logger.info("Storing raw counts in layer 'counts'")
-        adata.layers["counts"] = adata.X.copy()
+        if save_raw_counts or (save_raw_counts is None and 'counts' not in adata.layers.keys()):
+            logger.info("Storing raw counts in layer 'counts'")
+            adata.layers["counts"] = adata.X.copy()
         adata.obs['size_factors'] = size_factors
         logger.info("Doing normalisation using size factors")
         adata.X /= adata.obs['size_factors'].values[:, None]
@@ -351,7 +435,8 @@ def reintegrate(adata, n_top_genes=3000, npcs=100, batch_key='sample', use_batch
     sc.tl.umap(adata)
 
 
-def merge_adata(*adatas, join='outer', batch_correct=True, log=False, raw=False, index_unique='-', **kwargs):
+def merge_adata(*adatas, join='outer', batch_correct=True, 
+                log=False, raw=False, index_unique='-', **kwargs):
     if raw:
         adata = adatas[0].raw
         for i in range(1, len(adatas)):
@@ -359,11 +444,11 @@ def merge_adata(*adatas, join='outer', batch_correct=True, log=False, raw=False,
     else:
         adata = adatas[0].concatenate(adatas[1:], join=join, index_unique=index_unique)
 
-    sc.pp.filter_genes(adata, min_cells=10)
+    #sc.pp.filter_genes(adata, min_cells=10)
     if log:
         sc.pp.log1p(adata)
 
     if batch_correct:
-        reintegrate(adata, **kwargs)
+        relayout(adata, **kwargs)
 
     return adata
