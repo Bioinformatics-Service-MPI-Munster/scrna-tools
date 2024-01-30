@@ -1,0 +1,72 @@
+#!/usr/bin/env python
+
+import os
+import argparse
+from scrna_tools.mapping import rhapsody_extract_barcodes
+from distutils.dir_util import copy_tree
+from collections import defaultdict
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='A Rhapsody preprocessing script.'
+    )
+
+    parser.add_argument(
+        'fastq_r1',
+        help='First FASTQ file (with unprocessed barcode and UMI reads)'
+    )
+    
+    parser.add_argument(
+        'fastq_r2',
+        help='Second FASTQ file (with mRNA/cDNA reads)'
+    )
+    
+    parser.add_argument(
+        'output_r1',
+        help='First output FASTQ file (with processed barcode and UMI)'
+    )
+    
+    parser.add_argument(
+        'output_r2',
+        help='Second output FASTQ file (with mRNA/cDNA reads)'
+    )
+
+    parser.add_argument(
+        '-w', '--whitelist', dest='whitelist_file',
+        help='BD Rhapsody whitelist file'
+    )
+    
+    parser.add_argument(
+        '-c', '--whitelist-cutoff', dest='whitelist_cutoff',
+        type=int,
+        default=10,
+        help='Only write barcode to file if it has been observed more times than this cutoff. Only affects -b',
+    )
+    
+    parser.add_argument(
+        '-b', '--barcodes', dest='barcodes_file',
+        help='Write extracted barcodes (custom whitelist) to this file'
+    )
+
+    args = parser.parse_args()
+
+    fastq_1_file= os.path.expanduser(args.fastq_r1)
+    fastq_2_file= os.path.expanduser(args.fastq_r2)
+    output_1_file = os.path.expanduser(args.output_r1)
+    output_2_file = os.path.expanduser(args.output_r2)
+    whitelist_file = os.path.expanduser(args.whitelist_file) if args.whitelist_file else None
+    whitelist_cutoff = args.whitelist_cutoff
+    barcodes_file = os.path.expanduser(args.barcodes_file) if args.barcodes_file else None
+
+    rhapsody_extract_barcodes(fastq_1_file, output_1_file,
+                              fastq_2_file=fastq_2_file, output_2_file=output_2_file,
+                              expected_barcode_length=27,
+                              barcodes_output_file=barcodes_file, whitelist_file=whitelist_file,
+                              whitelist_cutoff=whitelist_cutoff)
+
+if __name__ == '__main__':
+    main()
