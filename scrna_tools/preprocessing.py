@@ -17,13 +17,42 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def read_star_data(matrix_mtx_file, barcodes_file, features_file, barcodes_suffix=None, use_gene_ids_as_index=False):
-
+def read_barcodes(
+    barcodes_file, 
+    barcodes_suffix=None
+):
     if barcodes_suffix is None:
         barcodes_suffix = ''
     else:
         barcodes_suffix = '_' + barcodes_suffix
+    
+    if isinstance(barcodes_file, (str, bytes)):
+        barcodes = []
+        with smart_open(barcodes_file, mode='r') as bf:
+            for line in bf:
+                if isinstance(line, bytes):
+                    line = line.decode('utf-8')
+                
+                line = line.rstrip()
+                if line == '' or line.startswith("#"):
+                    continue
+                barcode = line
+                barcodes.append(barcode + barcodes_suffix)
+    elif isinstance(barcodes_file, (list, tuple)):
+        barcodes = [b + barcodes_suffix for b in barcodes_file]
+    else:
+        raise ValueError("barcodes_file must be a string (file name) or a list of strings")
 
+    return barcodes
+
+
+def read_star_data(
+    matrix_mtx_file, 
+    barcodes_file, 
+    features_file, 
+    barcodes_suffix=None, 
+    use_gene_ids_as_index=False
+):
     adata = sc.read_mtx(matrix_mtx_file)
 
     gene_ids = []
@@ -52,17 +81,10 @@ def read_star_data(matrix_mtx_file, barcodes_file, features_file, barcodes_suffi
     else:
         var = pd.DataFrame(index=gene_ids)
     
-    barcodes = []
-    with smart_open(barcodes_file, mode='r') as bf:
-        for line in bf:
-            if isinstance(line, bytes):
-                line = line.decode('utf-8')
-            
-            line = line.rstrip()
-            if line == '' or line.startswith("#"):
-                continue
-            barcode = line
-            barcodes.append(barcode + barcodes_suffix)
+    barcodes = read_barcodes(
+        barcodes_file, 
+        barcodes_suffix=barcodes_suffix
+    )
     obs = pd.DataFrame(index=barcodes)
 
     final = sc.AnnData(adata.X.T, obs=obs, var=var)
@@ -244,7 +266,7 @@ def activation_score_genes_marsh_et_al(mouse_naming_scheme=True, orthologs=None)
         genes = ['FOS', 'JUNB', 'ZFP36', 'JUN', 'HSPA1B', 'SOCS3', 'RGS1', 'EGR1', 'BTG2', 
                  'FOSB', 'HIST1H1D', 'IER5', '1500015O10Rik', 'ATF3', 'HIST1H2AC', 
                  'DUSP1', 'HIST1H1E', 'FOLR1', 'SERPINE1']
-        
+    
     if orthologs is not None:
         if isinstance(orthologs, string_types):
             orthologs = ortholog_dict(orthologs)
