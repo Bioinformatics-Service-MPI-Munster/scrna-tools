@@ -8,18 +8,36 @@ import json
 import re
 from collections import defaultdict, Counter
 from future.utils import string_types
-from .process import relayout, recluster, recalculate_markers, cell_cycle_regression, rename_groups, gene_stats
-from .plotting import color_cycle, embedding_plot, rank_genes_groups_heatmap, volcano_plot_from_df, violin_plot
+from .process import relayout, recluster, recalculate_markers, cell_cycle_regression, gene_stats, rename_groups
+from .plotting import color_cycle, embedding_plot, volcano_plot_from_df, violin_plot
 from .helpers import markers_to_df
 from .trajectory import paga
 from .r import de_pseudobulk, slingshot
 from functools import wraps
 import requests
-import gseapy
 import time
 import logging
 
+try:
+    import gseapy
+    with_gseapy = True
+except (ModuleNotFoundError, OSError):
+    with_gseapy = False
+
+
 logger = logging.getLogger('__name__')
+
+
+def requires_gseapy(func):
+    """Checks if gseapy is installed in path"""
+    
+    @wraps(func)
+    def wrapper_gseapy(*args, **kwargs):
+        if not with_gseapy:
+            raise RuntimeError("gseapy is not installed, cannot "
+                               "run code that depends on it!")
+        return func(*args, **kwargs)
+    return wrapper_gseapy
 
 
 class ConstrainedAdata(object):
@@ -165,9 +183,9 @@ class ConstrainedAdata(object):
     
     def add_categorical_obs_constraint(self, *args, **kwargs):
         # compatibility with AnnDataView
-        if 'key' in kwargs and not 'group_key' in kwargs:
+        if 'key' in kwargs and 'group_key' not in kwargs:
             kwargs['group_key'] = kwargs.pop('key')
-        if 'categories' in kwargs and not 'groups' in kwargs:
+        if 'categories' in kwargs and 'groups' not in kwargs:
             kwargs['groups'] = kwargs.pop('categories')
             
         return self.add_categorical_constraint(*args, **kwargs)
@@ -1002,6 +1020,7 @@ class ConstrainedAdata(object):
         
         return volcano_plot_from_df(df, **kwargs)
 
+    @requires_gseapy
     def de_gsea(self, sample_key, sample1, sample2,
                 gene_sets,
                 subset_key=None,
@@ -1038,6 +1057,7 @@ class ConstrainedAdata(object):
 
         return pre_res, results
 
+    @requires_gseapy
     def _enrichr(self, df, gene_sets, organism, output_folder,
                  padj_cutoff=0.01, log2fc_cutoff=1.5,
                  absolute_log2fc=False, make_plots=True,
@@ -1241,18 +1261,18 @@ class ConstrainedAdata(object):
 
         return df
 
-    def markers_plot(self, groupby, groups=None,
-                     subset=None, force=False,
-                     markers_key=None, **kwargs):
-        if markers_key is None:
-            markers_key = self._markers_key(groupby,
-                                            subset_key=subset,
-                                            groups=groups)
-        if not markers_key in self.adata.uns_keys() or force:
-            self.markers(groupby=groupby, groups=groups, subset=subset)
+    # def markers_plot(self, groupby, groups=None,
+    #                  subset=None, force=False,
+    #                  markers_key=None, **kwargs):
+    #     if markers_key is None:
+    #         markers_key = self._markers_key(groupby,
+    #                                         subset_key=subset,
+    #                                         groups=groups)
+    #     if not markers_key in self.adata.uns_keys() or force:
+    #         self.markers(groupby=groupby, groups=groups, subset=subset)
 
-        return rank_genes_groups_heatmap(self.adata_subset, groupby=groupby, groups=groups,
-                                         key=markers_key, **kwargs)
+    #     return rank_genes_groups_heatmap(self.adata_subset, groupby=groupby, groups=groups,
+    #                                      key=markers_key, **kwargs)
         
     def violin_plot(self, *args, **kwargs):
         return violin_plot(self, *args, **kwargs)
