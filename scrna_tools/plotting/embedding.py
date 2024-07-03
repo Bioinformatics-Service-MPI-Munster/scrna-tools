@@ -28,7 +28,9 @@ def embedding_plot_data(
     layer=None,
     dimensions=(0, 1),
     exclude_nan=False,
-    nan_replacement='NA'
+    nan_replacement='NA',
+    subsample=None,
+    random_seed=42,
 ):
     from .._core import VData
     
@@ -109,7 +111,14 @@ def embedding_plot_data(
             if category in split_categories:
                 split_data[category] = sub_data.drop(splitby, axis=1)
         data = split_data
-        
+    
+    # subsample
+    if subsample is not None:
+        data = data.sample(
+            n=subsample,
+            replace=False,
+            random_state=random_seed,
+        )
     return data
 
 
