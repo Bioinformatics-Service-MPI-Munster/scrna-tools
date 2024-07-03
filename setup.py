@@ -33,14 +33,14 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
-        'numpy>=1.16.0',
+        'numpy>=1.16.0,<2.0.0',
         'scipy',
         'matplotlib>=3.1.0',
         'pandas>=0.15.0',
         'anndata',
         'scanpy',
         'requests',
-        'gseapy',
+        #'gseapy',
         'h5py',
         'adjustText',
         'loompy',
@@ -55,7 +55,8 @@ setup(
         'regex',
         'anndataview',
         'pydeseq2',
-        'textalloc'
+        'textalloc',
+        'packaging',
     ],
     cmdclass={
         'clean': CleanCommand
