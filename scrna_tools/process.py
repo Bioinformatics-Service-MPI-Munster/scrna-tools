@@ -15,9 +15,28 @@ import json
 from .helpers import markers_to_df, mkdir
 import requests
 import time
-import gseapy
 import warnings
+from functools import wraps
 import logging
+
+try:
+    import gseapy
+    with_gseapy = True
+except (ModuleNotFoundError, OSError):
+    with_gseapy = False
+
+
+def requires_gseapy(func):
+    """Checks if gseapy is installed in path"""
+    
+    @wraps(func)
+    def wrapper_gseapy(*args, **kwargs):
+        if not with_gseapy:
+            raise RuntimeError("gseapy is not installed, cannot "
+                               "run code that depends on it!")
+        return func(*args, **kwargs)
+    return wrapper_gseapy
+
 
 logger = logging.getLogger('__name__')
 
@@ -115,6 +134,7 @@ def relayout(
     batch_algorithm='harmony', 
     batch_key='sample', 
     n_top_genes=3000,
+    n_neighbors=30,
     umap=True, 
     tsne=True, 
     fdl=False, 
@@ -176,7 +196,7 @@ def relayout(
         integrated_key = 'X_pca'
 
     logger.info("Calculating neighbors")
-    sc.pp.neighbors(adata, n_pcs=n_pcs, use_rep=integrated_key, knn=True, n_neighbors=30)
+    sc.pp.neighbors(adata, n_pcs=n_pcs, use_rep=integrated_key, knn=True, n_neighbors=n_neighbors)
     neighbors_key = 'neighbors' if key_prefix is None else f'{key_prefix}_neighbors'
     connectivities_key = 'connectivities' if key_prefix is None else f'{key_prefix}_connectivities'
     distances_key = 'distances' if key_prefix is None else f'{key_prefix}_distances'
@@ -214,6 +234,7 @@ def relayout(
             logger.warning("To use FDL layout you have to install palantir and harmony. Skipping FDL.")
 
     return adata_original
+
 
 
 def recalculate_markers(
@@ -343,10 +364,18 @@ def cell_cycle_regression(cadata, score_fields=['G2M_score', 'S_score'], suffix=
     return adata_no_cc
 
 
-def gene_stats(vdata, genes=None, layer=None, 
-               groupby=None, groups=None, 
-               include_rest=False, ignore_groups=('NA', 'NaN'),
-               mean_expression=True, percent_expressed=True, sd_expression=False):
+def gene_stats(
+    vdata, 
+    genes=None, 
+    layer=None,
+    groupby=None, 
+    groups=None,
+    include_rest=False, 
+    ignore_groups=('NA', 'NaN'),
+    mean_expression=True, 
+    percent_expressed=True, 
+    sd_expression=False
+):
     vdata = vdata.copy(only_constraints=True)
 
     if genes is not None:
@@ -376,7 +405,7 @@ def gene_stats(vdata, genes=None, layer=None,
         
     stats = pd.DataFrame(index=vdata.var.index)
     for group, ixs in group_ixs.items():
-        group_clean = group.replace(' ', '_')
+        group_clean = group.replace(' ', '_').replace('.', '_')
         x_sub = x[ixs, :]
         
         if percent_expressed:
@@ -526,7 +555,6 @@ def enrichr(
     make_plots=True,
     enrichr_cutoff=1, 
     max_attempts=3,
-    decription='test', 
     log2_fold_change_field='log2FoldChange',
     padj_field='padj',
     **kwargs
@@ -557,15 +585,16 @@ def enrichr(
     while not success:
         attempt += 1
         try:
-            enr = gseapy.enrichr(gene_list=glist,
-                                    gene_sets=gene_sets,
-                                    organism=organism,
-                                    description=decription,
-                                    outdir=output_folder,
-                                    no_plot=not make_plots,
-                                    cutoff=enrichr_cutoff,
-                                    background=bg,
-                                    **kwargs)
+            enr = gseapy.enrichr(
+                gene_list=glist,
+                gene_sets=gene_sets,
+                organism=organism,
+                outdir=output_folder,
+                no_plot=not make_plots,
+                cutoff=enrichr_cutoff,
+                background=bg,
+                **kwargs
+            )
             success = True
         except requests.exceptions.ConnectionError:
             if attempt > max_attempts:
@@ -628,10 +657,11 @@ def enrichr_bulk(
                 except Exception as e:
                     print(df)
                     print(name)
-                    raise
+                    #raise
                     continue
 
 
+@requires_gseapy
 def gsea_from_df(
     df,
     gene_sets,
@@ -730,6 +760,7 @@ def pseudobulk_expression_matrix_and_annotations(
     layer='counts',
     replicate_key=None,
     n_pseudoreplicates=2,
+    pseudocount=0,
     random_seed=42,
 ):
     vdata = vdata.copy(only_constraints=True)
@@ -755,9 +786,15 @@ def pseudobulk_expression_matrix_and_annotations(
     if replicate_key is None:
         n_replicates = n_pseudoreplicates
         replicate_key = '__replicate__'
-        np.random.seed(random_seed)
-        obs[replicate_key] = pd.Categorical(np.random.choice([str(i) for i in range(1, n_pseudoreplicates + 1)],
-                                                            size=obs.shape[0]))
+        
+        rng = np.random.default_rng(random_seed)
+        #np.random.seed(random_seed)
+        obs[replicate_key] = pd.Categorical(
+            rng.choice(
+                [str(i) for i in range(1, n_pseudoreplicates + 1)],
+                size=obs.shape[0]
+            )
+        )
     else:
         obs[replicate_key] = vdata.obs[replicate_key]
         n_replicates = len(obs[replicate_key].unique())
@@ -773,6 +810,7 @@ def pseudobulk_expression_matrix_and_annotations(
     except TypeError:
         expr = vdata.adata_subset[mm.index].layers[layer].toarray()
     mat_mm = np.matmul(expr.T, mm)
+    #print(type(mat_mm))
     mat_mm.index = vdata.var.index.copy()
     
     mat_mm_int = np.round(mat_mm)
@@ -780,7 +818,7 @@ def pseudobulk_expression_matrix_and_annotations(
         warnings.warn("Counts matrix contains floats! These will be explicitly "
                       "rounded to the nearest integer. Please ensure that this is "
                       "intentional!")
-    mat_mm = mat_mm_int
+    mat_mm = mat_mm_int.add(pseudocount)
 
     # get sample annotations
     data = defaultdict(list)
@@ -811,6 +849,7 @@ def de_df_to_parquet(
     obs_constraints=(),
     var_constraints=(),
     lfc_shrink=False,
+    pseudocount=0,
     analysis_name='Pseudobulk DE or Markers',
 ):
     if output_file is None:
@@ -826,6 +865,7 @@ def de_df_to_parquet(
         'obs_constraints': json.dumps([c.to_dict() for c in obs_constraints]),
         'var_constraints': json.dumps([c.to_dict() for c in var_constraints]),
         'lfc_shrink': 'true' if lfc_shrink else 'false',
+        'pseudocount': str(pseudocount),
     }
     if view_key is not None:
         meta['view_key'] = view_key
@@ -858,6 +898,7 @@ def de(
     as_parquet=False,
     view_key=None,
     lfc_shrink=False,
+    pseudocount=0,
     _logger=logger,
 ):
     if not has_pydeseq2:
@@ -883,7 +924,8 @@ def de(
         replicate_key=replicate_key,
         n_pseudoreplicates=n_pseudoreplicates,
         layer=layer,
-        random_seed=random_seed
+        random_seed=random_seed,
+        pseudocount=pseudocount,
     )
     pb_replicate_key = pb_info['replicate_key']
     pb_obs_key = pb_info['obs_key']
@@ -920,7 +962,6 @@ def de(
         dds,
         contrast=contrast,
         alpha=1,
-        n_cpus=threads, 
         independent_filter=True,
         cooks_filter=True,
     )
@@ -929,7 +970,7 @@ def de(
     if lfc_shrink and not stat_res.shrunk_LFCs:
         _logger.info("Applying log-fold shrinkage")
         stat_res.lfc_shrink(coeff=None)
-
+    
     results_df = stat_res.results_df
     
     if append_gene_stats:
@@ -946,7 +987,7 @@ def de(
     
     results_df = results_df.sort_values(by='log2FoldChange', key=abs, ascending=False, kind='mergesort')
     results_df = results_df.sort_values(by='pvalue', kind='mergesort')
-
+    
     if as_parquet:
         return de_df_to_parquet(
             results_df, 
@@ -958,6 +999,7 @@ def de(
             obs_constraints=obs_constraints,
             var_constraints=var_constraints,
             lfc_shrink=lfc_shrink,
+            pseudocount=pseudocount,
         )
     
     return results_df
@@ -996,12 +1038,16 @@ def markers(
         category_clean = category.replace(' ', '_').replace('.', '_')
         _logger.info(f"Calculating markers for {category_clean} ({i+1}/{len(categories)})")
         
+        print(category, category_clean, categories)
+        
         markers = de_func(vdata, key, category, **kwargs)
         markers['group'] = category
+        print(markers.columns)
         markers = markers.rename({
             f'mean_expression_{category_clean}': 'mean_expression_group',
             f'percent_expressed_{category_clean}': 'percent_expressed_group',
         }, axis=1)
+        print(markers.columns)
 
         if all_markers is None:
             all_markers = markers
@@ -1064,11 +1110,11 @@ def paga(
     if save_to_adata:
         adata = vdata._parent_adata
         
-        view_obs_key = f'__view__{restore_view}__{obs_key}'
+        view_obs_key = f'__view__{restore_view}__{obs_key}' if restore_view is not None else obs_key
         if view_obs_key not in adata.obs.columns:
             view_obs_key = obs_key
         
-        view_obsm_key = f'__view__{restore_view}__{obsm_key}'
+        view_obsm_key = f'__view__{restore_view}__{obsm_key}' if restore_view is not None else obsm_key
         if view_obsm_key not in adata.obsm.keys():
             view_obsm_key = obsm_key
             
