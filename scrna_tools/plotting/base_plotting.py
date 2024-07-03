@@ -1252,6 +1252,9 @@ def violin_plot_from_df(
             df = df.copy()
             df['__x'] = ""
             x = '__x'
+        split = True
+    else:
+        split=False
 
     ax = sns.violinplot(
         x=x,
@@ -1259,12 +1262,12 @@ def violin_plot_from_df(
         hue=hue, 
         scale=scale,
         data=df, 
-        split=True, 
+        split=split, 
         order=order,
         hue_order=hue_order,
         palette=palette, 
         ax=ax, 
-        **kwargs
+        #**kwargs
     )
     if swarm:
         np.random.seed(shuffle_seed)
@@ -1283,7 +1286,7 @@ def violin_plot_from_df(
             ax=ax, 
             **kwargs
         )
-        
+    
     ax.set_xticklabels([label.get_text() for label in ax.get_xticklabels()], rotation=90)
     ax.set_xlabel("")
     ax.set_ylabel(value_key)
@@ -1552,6 +1555,8 @@ def cpdb_dot_plot_dfs(
     marker_scale=2, 
     min_pvalue=1e-3, 
     max_pvalue=0.1,
+    lr_sep='--',
+    ct_sep='--',
 ):
     if not isinstance(dfs, (tuple, list)):
         dfs = [dfs]
@@ -1560,8 +1565,8 @@ def cpdb_dot_plot_dfs(
     for df in dfs:
 
         df_dot = pd.DataFrame({
-            'lr': [f'{l}--{r}' for l, r in zip(df['ligand'], df['receptor'])],
-            'ct': [f'{lct}--{rct}' for lct, rct in zip(df['ligand_celltype'], df['receptor_celltype'])],
+            'lr': [f'{l}{lr_sep}{r}' for l, r in zip(df['ligand'], df['receptor'])],
+            'ct': [f'{lct}{ct_sep}{rct}' for lct, rct in zip(df['ligand_celltype'], df['receptor_celltype'])],
             'pvalue': df['pvalue'],
             'inv_pvalue': 1-df['pvalue'],
             'mean': df['mean'],
@@ -1580,8 +1585,8 @@ def cpdb_dot_plot_dfs(
             valid_lr = set()
             valid_ct = set()
             for fdf in filter_dfs:
-                valid_lr = valid_lr.union(set([f'{l}--{r}' for l, r in zip(fdf['ligand'], fdf['receptor'])]))
-                valid_ct = valid_ct.union(set([f'{lct}--{rct}' 
+                valid_lr = valid_lr.union(set([f'{l}{lr_sep}{r}' for l, r in zip(fdf['ligand'], fdf['receptor'])]))
+                valid_ct = valid_ct.union(set([f'{lct}{ct_sep}{rct}' 
                                 for lct, rct in zip(fdf['ligand_celltype'], fdf['receptor_celltype'])]))
             df_dot = df_dot.loc[np.logical_and(df_dot['lr'].isin(valid_lr), df_dot['ct'].isin(valid_ct)), :]
         df_dots.append(df_dot)
