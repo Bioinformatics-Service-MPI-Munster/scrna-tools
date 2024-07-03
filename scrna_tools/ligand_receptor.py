@@ -54,7 +54,6 @@ def cellphonedb(adata, groupby, output_folder, is_log=True,
     tmp_folder = None
     try:
         tmp_folder = tempfile.mkdtemp()
-        print(tmp_folder)
         matrix_file = os.path.join(tmp_folder, 'mat.tsv')
         df_expr_matrix.to_csv(matrix_file, sep='\t')
         meta_file = os.path.join(tmp_folder, 'meta.tsv')
