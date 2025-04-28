@@ -713,16 +713,34 @@ def _lr_get_valid(gene_a_names, gene_b_names,
     return valid, valid_ixs
 
 
-def cellphonedb_dot_plot(pvalues_files, means_files, sample_names=None,
-                         include_genes=None, include_regex=None, include_pairs=None, include_strict=False,
-                         exclude_genes=None, exclude_regex=None, exclude_pairs=None, exclude_strict=False,
-                         include_celltype_pairs=None, ct_separator='|',
-                         only_significant=False,
-                         only_differential=False, pvalue_cutoff=0.05,
-                         rl_separator="--", column_gap_size=2,
-                         fig=None, cmap='jet', vmin=-10, vmax=5,
-                         max_marker_size=30, row_height=.5, column_width=1,
-                         invert_x=False):
+def cellphonedb_dot_plot(
+    pvalues_files, 
+    means_files, 
+    sample_names=None,
+    include_genes=None, 
+    include_regex=None, 
+    include_pairs=None, 
+    include_strict=False,
+    exclude_genes=None, 
+    exclude_regex=None, 
+    exclude_pairs=None, 
+    exclude_strict=False,
+    include_celltype_pairs=None, 
+    ct_separator='|',
+    only_significant=False,
+    only_differential=False, 
+    pvalue_cutoff=0.05,
+    rl_separator="--", 
+    column_gap_size=2,
+    fig=None, 
+    cmap='jet', 
+    vmin=-10, 
+    vmax=5,
+    max_marker_size=30, 
+    row_height=.5, 
+    column_width=1,
+    invert_x=False
+):
     if not isinstance(pvalues_files, list) and not isinstance(pvalues_files, tuple):
         pvalues_files = [pvalues_files]
 
@@ -960,7 +978,7 @@ def cellphonedb_dot_plot(pvalues_files, means_files, sample_names=None,
 
 
 def volcano_plot_from_df(
-    df, plot_adjusted_pvalues=False,
+    df, 
     label_genes=None, 
     label_top_n=0, 
     min_pvalue=2.096468e-309,
@@ -982,11 +1000,11 @@ def volcano_plot_from_df(
     log2fc_field='log2fc', 
     pvalue_field='pval', 
     padj_field='padj',
+    y_maps_to='pval',
+    color_maps_to='padj',
     gene_name_field='name',
     label_size=7,
     adjust_labels=True, 
-    adjust_labels_iterations=50, 
-    adjust_labels_precision=0.01,
     xlim=None, 
     ylim=None, 
     ax=None, 
@@ -1019,26 +1037,24 @@ def volcano_plot_from_df(
     df.loc[df[pvalue_field] == 0, pvalue_field] = min_pvalue
     df.loc[df[padj_field] == 0, padj_field] = min_pvalue
 
-    if plot_adjusted_pvalues:
-        pvalues_field = padj_field
-    else:
-        pvalues_field = pvalue_field
+    y_field = padj_field if y_maps_to == 'padj' else pvalue_field
+    color_field = padj_field if color_maps_to == 'padj' else pvalue_field
 
     # insignificant
-    df_ins = df.loc[(df[log2fc_field].abs() < log2fc_cutoff) & (df[padj_field] > padj_cutoff)]
-    ax.scatter(df_ins[log2fc_field], -1*np.log10(df_ins[pvalues_field]), color=insignificant_color, **kwargs)
+    df_ins = df.loc[(df[log2fc_field].abs() < log2fc_cutoff) & (df[color_field] > padj_cutoff)]
+    ax.scatter(df_ins[log2fc_field], -1*np.log10(df_ins[y_field]), color=insignificant_color, **kwargs)
 
     # log2fc > cutoff
-    df_log2fc = df.loc[(df[log2fc_field].abs() >= log2fc_cutoff) & (df[padj_field] > padj_cutoff)]
-    ax.scatter(df_log2fc[log2fc_field], -1*np.log10(df_log2fc[pvalues_field]), color=logfc_color, **kwargs)
+    df_log2fc = df.loc[(df[log2fc_field].abs() >= log2fc_cutoff) & (df[color_field] > padj_cutoff)]
+    ax.scatter(df_log2fc[log2fc_field], -1*np.log10(df_log2fc[y_field]), color=logfc_color, **kwargs)
 
     # padj < cutoff
-    df_padj = df.loc[(df[log2fc_field].abs() < log2fc_cutoff) & (df[padj_field] <= padj_cutoff)]
-    ax.scatter(df_padj[log2fc_field], -1*np.log10(df_padj[pvalues_field]), color=padj_color, **kwargs)
+    df_padj = df.loc[(df[log2fc_field].abs() < log2fc_cutoff) & (df[color_field] <= padj_cutoff)]
+    ax.scatter(df_padj[log2fc_field], -1*np.log10(df_padj[y_field]), color=padj_color, **kwargs)
 
     # both
-    df_both = df.loc[(df[log2fc_field].abs() >= log2fc_cutoff) & (df[padj_field] <= padj_cutoff)]
-    ax.scatter(df_both[log2fc_field], -1*np.log10(df_both[pvalues_field]), color=both_color, **kwargs)
+    df_both = df.loc[(df[log2fc_field].abs() >= log2fc_cutoff) & (df[color_field] <= padj_cutoff)]
+    ax.scatter(df_both[log2fc_field], -1*np.log10(df_both[y_field]), color=both_color, **kwargs)
 
     # get labeled genes
     plot_labels = []
@@ -1052,18 +1068,23 @@ def volcano_plot_from_df(
             if label_top_only_significant and row[padj_field] > padj_cutoff:
                 continue
             plot_labels.append(row[gene_name_field])
-            plot_labels_xy.append((row[log2fc_field], -1*np.log10(row[pvalues_field])))
+            plot_labels_xy.append((row[log2fc_field], -1*np.log10(row[y_field])))
 
     if label_genes is not None:
         for gene in label_genes:
             try:
                 row = df.loc[gene]
             except KeyError:
-                warnings.warn("Gene '{}' not found in AnnData (subset) or not expressed".format(gene))
-                continue
+                row = df[df[gene_name_field == gene]]
+                if len(row) == 0:
+                    warnings.warn("Gene to label '{}' not found or not expressed".format(gene))
+                    continue
+                elif len(row) > 1:
+                    warnings.warn("Multiple genes match label '{}'. Use index instead?".format(gene))
+                    continue
             if row[gene_name_field] not in plot_labels:
                 plot_labels.append(row[gene_name_field])
-                plot_labels_xy.append((row[log2fc_field], -1*np.log10(row[pvalues_field])))
+                plot_labels_xy.append((row[log2fc_field], -1*np.log10(row[y_field])))
 
     if xlim is not None:
         x_min, x_max = xlim
@@ -1083,22 +1104,13 @@ def volcano_plot_from_df(
     if ylim is not None:
         ax.set_ylim(ylim)
 
-    texts = []
     texts_str = []
     for i, label in enumerate(plot_labels):
-        #text = ax.annotate(label, plot_labels_xy[i], fontsize=label_size)
-        #texts.append(text)
         texts_str.append(label)
     
     if adjust_labels and len(plot_labels_xy) > 0:
         start = datetime.now()
-        # adjust_text(
-        #     texts, 
-        #     arrowprops=dict(arrowstyle='-', color='grey'), 
-        #     lim=adjust_labels_iterations,
-        #     precision=adjust_labels_precision,
-        #     ax=ax
-        # )
+
         
         xy = np.array(plot_labels_xy)
         textalloc.allocate_text(
@@ -1121,7 +1133,7 @@ def volcano_plot_from_df(
         print(f'took: {(end - start).total_seconds()}')
 
     ax.set_xlabel("Log2-fold change expression")
-    ax.set_ylabel("-log10(adjusted p-value)" if plot_adjusted_pvalues else "-log10(p-value)")
+    ax.set_ylabel("-log10(adjusted p-value)" if y_maps_to == 'padj' else "-log10(p-value)")
 
     return ax
 
@@ -1570,9 +1582,16 @@ def cpdb_dot_plot_dfs(
             'pvalue': df['pvalue'],
             'inv_pvalue': 1-df['pvalue'],
             'mean': df['mean'],
-            'size': [_p_to_size(p, base_size=base_marker_size, scale=marker_scale,
-                                min_p=min_pvalue, max_p=max_pvalue) 
-                    for p in df['pvalue']]
+            'size': [
+                _p_to_size(
+                    p, 
+                    base_size=base_marker_size, 
+                    scale=marker_scale,
+                    min_p=min_pvalue, 
+                    max_p=max_pvalue
+                ) 
+                for p in df['pvalue']
+            ]
         })
         
         if filter_dfs is not None:
@@ -1585,9 +1604,18 @@ def cpdb_dot_plot_dfs(
             valid_lr = set()
             valid_ct = set()
             for fdf in filter_dfs:
-                valid_lr = valid_lr.union(set([f'{l}{lr_sep}{r}' for l, r in zip(fdf['ligand'], fdf['receptor'])]))
-                valid_ct = valid_ct.union(set([f'{lct}{ct_sep}{rct}' 
-                                for lct, rct in zip(fdf['ligand_celltype'], fdf['receptor_celltype'])]))
+                valid_lr = valid_lr.union(
+                    set([
+                        f'{l}{lr_sep}{r}' 
+                        for l, r in zip(fdf['ligand'], fdf['receptor'])
+                    ])
+                )
+                valid_ct = valid_ct.union(
+                    set([
+                        f'{lct}{ct_sep}{rct}'
+                        for lct, rct in zip(fdf['ligand_celltype'], fdf['receptor_celltype'])
+                    ])
+                )
             df_dot = df_dot.loc[np.logical_and(df_dot['lr'].isin(valid_lr), df_dot['ct'].isin(valid_ct)), :]
         df_dots.append(df_dot)
 
@@ -1685,11 +1713,17 @@ def cpdb_dot_plot_from_prepared(
         kwargs.setdefault('vmax', max_mean)
         plot_data = ax.scatter(x, y, s=df_dot['size'], c=df_dot['mean'], **kwargs)
         
-        if n_dfs > 1:
-            labels = [name] * len(x)
-            secax = ax.secondary_xaxis('top')
-            secax.set_xticks(x)
-            secax.set_xticklabels(labels, rotation=90)
+    if n_dfs > 1:
+        x_sec = []
+        x_sec_labels = []
+        for ix in range(len(cts)):
+            for i, name in enumerate(df_dots.keys()):
+                x_sec.append(ix + offset[i])
+                x_sec_labels.append(name)
+
+        secax = ax.secondary_xaxis('top')
+        secax.set_xticks(x_sec)
+        secax.set_xticklabels(x_sec_labels, rotation=90)
     
     ax.set_xticks(range(len(cts)))
     ax.set_yticks(range(len(lrs)))

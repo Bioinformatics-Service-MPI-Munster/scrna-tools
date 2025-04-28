@@ -134,6 +134,7 @@ def embedding_plot_from_df(
     shuffle=True, 
     shuffle_seed=42,
     z_order_by_magnitude=False,
+    zorder_by_categories=False,
     simple_axes=True,
     label_groups=False,
     legend=True,
@@ -203,6 +204,16 @@ def embedding_plot_from_df(
     if colorby is not None:
         if data[colorby].dtype.name == 'category':
             categories = data[colorby].dtype.categories
+            
+            if zorder_by_categories:
+                new_data = None
+                for category in categories[::-1]:
+                    data_sub = data.loc[data[colorby] == category, :]
+                    if new_data is None:
+                        new_data = data_sub
+                    else:
+                        new_data = pd.concat([new_data, data_sub], axis=0)
+                data = new_data
 
             colors_dict = category_colors(
                 categories=categories,
@@ -496,12 +507,14 @@ def barcode_from_embedding_plot(
     kwargs.setdefault('obsm_key', 'X_umap')
     
     obsm_key = kwargs.pop('obsm_key')
+    dimensions = kwargs.pop('dimensions', (0, 1))
     
     df = embedding_plot_data(
         vdata,
         obsm_key=obsm_key,
         view_key=kwargs.pop('view_key', None),
         colorby=kwargs.pop('colorby'),
+        dimensions=dimensions,
     )
     ax = embedding_plot_from_df(
         df,
@@ -514,7 +527,7 @@ def barcode_from_embedding_plot(
         if not plt.fignum_exists(fig.number):
             return None
         coords = plt.ginput(1)
-        barcodes = find_cells_from_coords(vdata, obsm_key, coords[0][0], coords[0][1])
+        barcodes = find_cells_from_coords(vdata, obsm_key, coords[0][0], coords[0][1], dimensions=dimensions)
         if len(barcodes) > 0:
             plt.close(fig)
             return barcodes[0]
