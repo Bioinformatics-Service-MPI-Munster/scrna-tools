@@ -156,15 +156,38 @@ def to_loom(adata, output_file, layer=None, obs_keys=None, var_keys=None):
     return loom
 
 
-def find_cells_from_coords(adata, key, x, y, delta=0.1):
+def find_cells_from_coords(
+    adata, 
+    key, 
+    x, 
+    y, 
+    delta=None,
+    delta_x=None,
+    delta_y=None,
+    dimensions=(0, 1)
+):
+    print('Dimensions: ', dimensions, 'obsm key: ', key)
+    
+    coords = adata.obsm[key]
+    coord_range_x = np.max(coords[:, dimensions[0]]) - np.min(coords[:, dimensions[0]])
+    coord_range_y = np.max(coords[:, dimensions[1]]) - np.min(coords[:, dimensions[1]])
+    
+    # make delta 1% of coordinate range
+    if delta is None:
+        delta_x = delta_x or coord_range_x * 0.01
+        delta_y = delta_y or coord_range_y * 0.01
+    else:
+        delta_x = delta_x or delta
+        delta_y = delta_y or delta
+    
     coords = adata.obsm[key]
     x_constraint = np.logical_and(
-        coords[:, 0] < x + delta,
-        coords[:, 0] > x - delta,
+        coords[:, dimensions[0]] < x + delta_x,
+        coords[:, dimensions[0]] > x - delta_x,
     )
     y_constraint = np.logical_and(
-        coords[:, 1] < y + delta,
-        coords[:, 1] > y - delta,
+        coords[:, dimensions[1]] < y + delta_y,
+        coords[:, dimensions[1]] > y - delta_y,
     )
     return adata.obs.iloc[
         np.where(
@@ -174,7 +197,7 @@ def find_cells_from_coords(adata, key, x, y, delta=0.1):
 
 
 def merge_var_columns(var, key_prefix, dtype=None):
-    columns = [c for c in var.columns if bool(re.match(f'{key_prefix}-\d+', c))]
+    columns = [c for c in var.columns if bool(re.match(f'{key_prefix}-\\d+', c))]
 
     final_column = pd.Series(var[columns.pop(0)].to_list(), index=var.index, name=key_prefix)
     for column in columns:
