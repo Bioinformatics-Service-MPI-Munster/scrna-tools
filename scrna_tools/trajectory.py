@@ -17,8 +17,11 @@ from scipy.stats import zscore
 from .plotting import barcode_from_embedding_plot, category_colors
 from .r import slingshot as slingshot_r
 from ._core import VData
+from .helpers import find_cells_from_coords
 from tqdm import tqdm
 from itertools import cycle
+import json
+import scipy
 import logging
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -34,6 +37,7 @@ def paga(adata, groupby, pseudotime=True):
         sc.tl.diffmap(adata)
         sc.tl.dpt(adata)
     return adata
+
 
 def slingshot(
     vdata, 
@@ -54,7 +58,7 @@ def slingshot(
         categories = list(vdata.obs(view_key=view_key)[obs_key].unique())
     
     kwargs['add_obs'] = False
-    slingshot_pseudotime_data = slingshot_r(
+    slingshot_pseudotime_data, slingshot_lineages = slingshot_r(
         vdata, 
         obs_key, 
         output_folder,
@@ -85,10 +89,34 @@ def slingshot(
             adata.obs[pseudotime_key] = slingshot_pseudotime_data[f'slingPseudotime_{i}']
             adata.uns['pseudotime'][pseudotime_key] = pseudotime_data
             i += 1
+        
+        connectivities = np.zeros((len(categories), len(categories)))
+        for lineage in slingshot_lineages:
+            for i in range(1, len(lineage)):
+                ix1 = categories.index(lineage[i-1])
+                ix2 = categories.index(lineage[i])
+                connectivities[ix1, ix2] = 1
+                connectivities[ix2, ix1] = 1
+        
+        projection = kwargs.get('projection', 'X_umap')
+        trajectories = adata.uns['trajectory'] if 'trajectory' in adata.uns_keys() else {}
+        trajectories[pseudotime_key_prefix] = {
+            'categories': categories,
+            'connectivities': scipy.sparse.csr_matrix(connectivities),
+            'description': f'{pseudotime_description_base}',
+            'key': pseudotime_key_prefix,
+            'name': f'{pseudotime_name_base}',
+            'obs_constraints': json.dumps([c.to_dict() for c in vdata.obs_constraints]),
+            'var_constraints': json.dumps([c.to_dict() for c in vdata.var_constraints]),
+            'obs_key': obs_key if view_key is None else f'__view__{view_key}__{obs_key}',
+            'obsm_key': projection if view_key is None else f'__view__{view_key}__{projection}',
+            'type': 'SlingShot',
+        }
+        adata.uns['trajectory'] = trajectories
 
         return vdata
     else:
-        return slingshot_pseudotime_data
+        return slingshot_pseudotime_data, slingshot_lineages
 
 
 def dpt_pseudotime_from_subclusters(
@@ -97,6 +125,7 @@ def dpt_pseudotime_from_subclusters(
     categories=None, 
     starting_cell=None, 
     embedding='X_umap',
+    dimensions=(0, 1),
     pseudotime_key='dpt',
     pseudotime_name=None,
     pseudotime_description=None,
@@ -110,8 +139,21 @@ def dpt_pseudotime_from_subclusters(
         starting_cell = barcode_from_embedding_plot(
             vdata_sub, 
             obsm_key=embedding, 
-            colorby=obs_key
+            colorby=obs_key,
+            dimensions=dimensions,
         )
+    elif isinstance(starting_cell, (list, tuple)):
+        barcodes = find_cells_from_coords(
+            vdata_sub, 
+            embedding, 
+            starting_cell[0],
+            starting_cell[1],
+            dimensions=dimensions
+        )
+        if len(barcodes) > 0:
+            starting_cell = barcodes[0]
+        else:
+            raise ValueError("No cell found at coordinates.")
     
     adata_sub = vdata_sub.adata_view
     adata_sub.uns['iroot'] = adata_sub.obs.index.get_loc(starting_cell)
@@ -199,7 +241,7 @@ def pseudotime_binned_observations(
         pt_binned = []
         ct_high = []
         ct_low = []
-        for i in range(0, len(ex) - len(ex)%(bins-1) + l, l):
+        for i in range(0, len(ex) - len(ex)%(bins-1), l):
             pt_binned.append(np.nanmean(pt[i:i+window_size]))
             
             m = np.nanmean(ex[i:i+window_size,], axis=0)
