@@ -15,79 +15,148 @@ import tempfile
 from future.utils import string_types
 import logging
 
+try:
+    from cellphonedb.src.core.methods import cpdb_statistical_analysis_method
+    with_cellphonedb = True
+except (ModuleNotFoundError, OSError) as e:
+    with_cellphonedb = False
+
 logger = logging.getLogger(__name__)
 
 
-def cellphonedb(adata, groupby, output_folder, is_log=True,
-                ortholog_file=None, invert_orthologs=False,
-                lr_annotations_file=None,
-                sample_column=None, project_name='project', virtualenv=None,
-                output_format='parquet'):
-    if not isinstance(adata, VData) and not isinstance(adata, ConstrainedAdata):
+def cellphonedb(
+    adata, 
+    groupby, 
+    output_folder, 
+    cpdb_file=None,
+    remove_log=False,
+    ortholog_file=None, 
+    invert_orthologs=False,
+    lr_annotations_file=None,
+    sample_column=None, 
+    project_name='project', 
+    output_format='parquet',
+    command_line_version=False,
+    virtualenv=None,
+    cellphonedb_executable_path="cellphonedb",
+    force=False,
+    **kwargs,
+):
+    project_folder = os.path.join(output_folder, project_name)
+    
+    if not command_line_version and cpdb_file is None:
+        raise ValueError("Cellphonedb file (cpdb_file argument) is required for non-command line version")
+    
+    if os.path.exists(project_folder):
+        if force:
+            shutil.rmtree(project_folder)
+        else:
+            raise ValueError(f"Output folder already exists ({project_folder})")
+    mkdir(output_folder)
+    
+    if not isinstance(adata, VData):
         vdata = VData(adata)
     else:
         vdata = adata.copy(only_constraints=True)
-
-    X = vdata.X.toarray()
-    # remove log transform
-    if is_log:
-        X = np.expm1(X)
-
-    # transpose for cellphonedb orientation
-    df_expr_matrix = pd.DataFrame(X.T)
-    df_expr_matrix.columns = vdata.obs.index
-    gene_names = vdata.var.index.to_list()
     
+    adata_sub = vdata.adata_view
+    
+    meta_data = {
+        'cell': adata_sub.obs.index,
+        'cell_type': adata_sub.obs[groupby],
+    }
+    if sample_column is not None:
+        meta_data['sample'] = adata_sub.obs[sample_column]
+    
+    df_meta = pd.DataFrame(meta_data)
+    if command_line_version:
+        df_meta.set_index('cell', inplace=True)
+    elif not with_cellphonedb:
+        raise ImportError("Cellphonedb is not installed. Please install it to use this function.")
+        
+    gene_names = adata_sub.var['symbol'].to_list()
     converter = {}
     if ortholog_file is not None:
         converter = ortholog_dict(ortholog_file, invert=invert_orthologs)
-        gene_names = [converter.get(g, g) for g in gene_names]
-    df_expr_matrix.index = gene_names
+        adata_sub.var.index = [converter.get(g, g) for g in gene_names]
 
-    meta_data = {'cell': list(vdata.obs.index),
-                 'cell_type': list(vdata.obs[groupby])}
-    if sample_column is not None:
-        meta_data['sample'] = vdata.obs[sample_column]
-    df_meta = pd.DataFrame(data=meta_data)
-    df_meta.set_index('cell', inplace=True)
+    if remove_log:
+        adata_sub.X = np.expm1(adata_sub.X)
 
     tmp_folder = None
     try:
         tmp_folder = tempfile.mkdtemp()
-        matrix_file = os.path.join(tmp_folder, 'mat.tsv')
-        df_expr_matrix.to_csv(matrix_file, sep='\t')
+        
+        tmp_output_folder = os.path.join(tmp_folder, project_name)
+        
         meta_file = os.path.join(tmp_folder, 'meta.tsv')
-        df_meta.to_csv(meta_file, sep='\t')
-        tmp_output_folder = os.path.join(tmp_folder, 'out')
+        df_meta.to_csv(meta_file, sep='\t', index=command_line_version)
+        
+        if command_line_version:
+            matrix_file = os.path.join(tmp_folder, 'mat.tsv')
+            
+            df_expr_matrix = pd.DataFrame(adata_sub.X.toarray().T)
+            df_expr_matrix.columns = adata_sub.obs.index
+            df_expr_matrix.index = adata_sub.var.index
 
-        with open(os.path.join(tmp_folder, 'command.sh'), 'w') as command_file:
-            if virtualenv is not None:
-                command_file.write('eval "$(pyenv init -)"\n')
-                command_file.write('export -f pyenv\n')
-                command_file.write("pyenv shell {}\n".format(virtualenv))
+            df_expr_matrix.to_csv(matrix_file, sep='\t')
+            
+            with open(os.path.join(tmp_folder, 'command.sh'), 'w') as command_file:
+                if virtualenv is not None:
+                    command_file.write('eval "$(pyenv init -)"\n')
+                    command_file.write('export -f pyenv\n')
+                    command_file.write("pyenv shell {}\n".format(virtualenv))
 
-            command_file.write("cellphonedb method statistical_analysis --counts-data hgnc_symbol "
-                               "--output-path {out} --project-name {project} "
-                               "{meta} {mat}\n".format(out=tmp_output_folder, project=project_name,
-                                                       meta=meta_file, mat=matrix_file))
-            command_file.flush()
+                command_file.write(
+                    "{path} method statistical_analysis --counts-data hgnc_symbol "
+                    "--output-path {out} --project-name {project} "
+                    "{meta} {mat}\n".format(
+                        out=tmp_output_folder, 
+                        project=project_name,
+                        meta=meta_file, 
+                        mat=matrix_file,
+                        path=cellphonedb_executable_path
+                    )
+                )
+                command_file.flush()
 
-            with open(os.path.join(output_folder, '{}_cpdb_log.txt'.format(project_name)), mode='w') as log:
-                res = subprocess.call(["sh", command_file.name], stdout=log, stderr=log)
-            if res != 0:
-                raise RuntimeError("Cellphonedb had non-zero exit status")
-
-        output_folder = mkdir(output_folder)
-        shutil.move(os.path.join(tmp_output_folder, project_name), output_folder)
+                with open(os.path.join(output_folder, '{}_cpdb_log.txt'.format(project_name)), mode='w') as log:
+                    res = subprocess.call(["sh", command_file.name], stdout=log, stderr=log)
+                if res != 0:
+                    raise RuntimeError("Cellphonedb had non-zero exit status")
+            
+            shutil.move(os.path.join(tmp_output_folder, project_name), project_folder)
+            output_pvalues = os.path.join(project_folder, project_name, 'pvalues.txt')
+            output_means = os.path.join(project_folder, project_name, 'means.txt')
+        else:
+            matrix_file = os.path.join(tmp_folder, 'counts.h5ad')
+            adata_sub.write(matrix_file)
+            
+            cpdb_results = cpdb_statistical_analysis_method.call(
+                cpdb_file_path = cpdb_file,
+                meta_file_path = meta_file,
+                counts_file_path = matrix_file,
+                counts_data = 'hgnc_symbol',
+                output_path = tmp_output_folder,
+                output_suffix=project_name,
+                **kwargs,
+            )
+            
+            shutil.move(os.path.join(tmp_output_folder), project_folder)
+            output_pvalues = os.path.join(project_folder, f'statistical_analysis_pvalues_{project_name}.txt')
+            output_means = os.path.join(project_folder, f'statistical_analysis_means_{project_name}.txt')
     finally:
         if tmp_folder is not None:
             shutil.rmtree(tmp_folder)
             pass
     
     logger.info("Appending LR and expression info")
-    df = cpdb_to_df(os.path.join(output_folder, project_name, 'pvalues.txt'),
-                    os.path.join(output_folder, project_name, 'means.txt'),
-                    ortholog_file={v: k for k, v in converter.items()} if ortholog_file is not None else None)
+    df = cpdb_to_df(
+        output_pvalues,
+        output_means,
+        ortholog_file={v: k for k, v in converter.items()} if ortholog_file is not None else None,
+        start_field=11 if command_line_version else 14,
+    )
     if lr_annotations_file is not None:
         df = append_lr_annotations(df, lr_annotations_file)
     df = append_expression_information(df, vdata.adata_view, groupby)
@@ -294,7 +363,7 @@ def nichenet_ligand_activities(adata, groupby, geneset_of_interest,
     return pd.DataFrame.from_records(results)
 
 
-def _cpdb_matrix_to_df(matrix_file):
+def _cpdb_matrix_to_df(matrix_file, start_field=11):
     columns = ['ligand', 'receptor', 'ligand_celltype', 'receptor_celltype', 
                'secreted', 'integrin', 'ligand_complex', 'receptor_complex',
                'value']
@@ -308,7 +377,7 @@ def _cpdb_matrix_to_df(matrix_file):
             fields = line.split("\t")
             if celltype_pairs is None:
                 celltype_pairs = []
-                for col in range(11, len(fields)):
+                for col in range(start_field, len(fields)):
                     ct1, ct2 = fields[col].split("|")
                     celltype_pairs.append((ct1, ct2))
                     celltype_cols[(ct1, ct2)] = col
@@ -326,8 +395,8 @@ def _cpdb_matrix_to_df(matrix_file):
                 is_complex_a = fields[2].startswith('complex')
                 is_complex_b = fields[3].startswith('complex')
                 
-                for col in range(11, len(fields)):
-                    ix = col - 11
+                for col in range(start_field, len(fields)):
+                    ix = col - start_field
                     # check which gene is receptor
                     if is_receptor_a and not is_receptor_b:
                         ligand, receptor = gene_b, gene_a
@@ -346,8 +415,13 @@ def _cpdb_matrix_to_df(matrix_file):
     return df
 
 
-def cpdb_to_df(pvalues_file, means_file,
-               ortholog_file=None, invert_orthologs=False):
+def cpdb_to_df(
+    pvalues_file, 
+    means_file,
+    ortholog_file=None, 
+    invert_orthologs=False,
+    **kwargs,
+):
     if ortholog_file is not None:
         if isinstance(ortholog_file, dict):
             oc = ortholog_file
@@ -356,8 +430,8 @@ def cpdb_to_df(pvalues_file, means_file,
     else:
         oc = dict()
     
-    p_df = _cpdb_matrix_to_df(pvalues_file)
-    m_df = _cpdb_matrix_to_df(means_file)
+    p_df = _cpdb_matrix_to_df(pvalues_file, **kwargs)
+    m_df = _cpdb_matrix_to_df(means_file, **kwargs)
     
     try:
         assert_series_equal(p_df['ligand'], m_df['ligand'])
@@ -381,6 +455,69 @@ def cpdb_to_df(pvalues_file, means_file,
     
     return df
 
+
+def cpdb_filter_df(
+    df,
+    pvalue_cutoff=0,
+    mean_cutoff=0,
+    ligand_celltypes=None,
+    receptor_celltypes=None,
+    pathways=None,
+    autocrine=True,
+    celltype_restrictions=None,
+    secreted_interactions=True,
+    cell_cell_interactions=True,
+    lr_pairs=None,
+    genes=None,
+):
+    df_sub = df.copy()
+
+    # filter for p-value
+    df_sub = df_sub.loc[np.logical_and(df['pvalue'] <= pvalue_cutoff, np.isfinite(df['pvalue'])), :]
+    
+    # filter for mean
+    df_sub = df_sub.loc[np.logical_and(df_sub['mean'] >= mean_cutoff, np.isfinite(df_sub['mean'])), :]
+    
+    if ligand_celltypes is not None:
+        df_sub = df_sub.loc[df_sub['ligand_celltype'].isin(ligand_celltypes), :]
+    
+    if receptor_celltypes is not None:
+        df_sub = df_sub.loc[df_sub['receptor_celltype'].isin(receptor_celltypes), :]
+    
+    if pathways is not None:
+        df_sub = df_sub.loc[df_sub['pathway'].isin(pathways), :]
+
+    if not autocrine:
+        df_sub = df_sub.loc[df_sub['ligand_celltype'] != df_sub['receptor_celltype'], :]
+    
+    if celltype_restrictions is not None and len(celltype_restrictions) > 0:
+        df_sub = df_sub.loc[
+            np.logical_or(
+                df_sub['ligand_celltype'].isin(celltype_restrictions),
+                df_sub['receptor_celltype'].isin(celltype_restrictions),
+            ), 
+            :
+        ]
+
+    if not secreted_interactions:
+        df_sub = df_sub.loc[~df_sub['secreted'], :]
+    if not cell_cell_interactions:
+        df_sub = df_sub.loc[df_sub['secreted'], :]
+    
+    genes = genes or []
+    lr_pairs = lr_pairs or []
+    if len(genes) > 0 or len(lr_pairs) > 0:
+        lr_valid = pd.Series(zip(df_sub["ligand"], df_sub["receptor"])).isin(lr_pairs).to_numpy()
+        ligand_or_receptor_valid = np.logical_or(
+            df_sub['ligand'].isin(genes),
+            df_sub['receptor'].isin(genes),
+        )
+
+        valid = np.logical_or(lr_valid, ligand_or_receptor_valid)
+        df_sub = df_sub.loc[valid, :]
+    
+    return df_sub
+    
 
 def append_lr_annotations(cpdb_df, lr_annotations, annotation_columns=('pathway', 'annotation')):
     if isinstance(lr_annotations, string_types):
