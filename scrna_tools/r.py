@@ -181,6 +181,19 @@ def slingshot(
         cdata = SingleCellExperiment::colData(sce)
         cdata <- subset(cdata, select = -c(slingshot))
         write.table(x=cdata, file=file.path('{output_folder}', '{prefix}_slingshot_colData.txt'), sep='\t', quote=F)
+        
+        print('Writing Lineages...')
+        print(file.path('{output_folder}', '{prefix}_slingshot_lineages.txt'))
+        print(colData(sce)[, 'slingshot'])
+        
+        lapply(
+            colData(sce)[, 'slingshot']@metadata$lineages, 
+            write, 
+            file.path('{output_folder}', '{prefix}_slingshot_lineages.txt'),
+            append=T, 
+            ncolumns=10000, 
+            sep="\t"
+        )
 
         as.data.frame(cdata)
         '''.format(output_folder=output_folder, groupby=groupby, projection=projection, start_cluster=start_cluster,
@@ -196,8 +209,13 @@ def slingshot(
                     vdata.adata.obs(view_key=view_key).loc[res.index, new_column] = res[column]
                 except AttributeError:
                     vdata._parent_adata.obs.loc[res.index, new_column] = res[column]
-                
-    return res
+    
+    lineages = []
+    with open(os.path.join(output_folder, f'{output_file_prefix}_slingshot_lineages.txt'), 'r') as f:
+        for line in f:
+            lineages.append(line.strip().split('\t'))
+    
+    return res, lineages
 
 
 @requires_rpy2
