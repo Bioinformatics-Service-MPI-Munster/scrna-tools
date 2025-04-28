@@ -92,6 +92,60 @@ def read_star_data(
     return final
 
 
+def read_multiplexed_star_data(
+    matrix_mtx_file, 
+    barcodes_file, 
+    features_file,
+    barcode_to_sample,
+    undetermined_sample_name='NA',
+    **kwargs
+):
+    adata = read_star_data(
+        matrix_mtx_file,
+        barcodes_file,
+        features_file,
+        **kwargs
+    )
+    
+    adata.obs['sample'] = pd.Categorical(
+        [
+            barcode_to_sample.get(b, undetermined_sample_name) for b in adata.obs.index
+        ]
+    )
+    
+    adatas = dict()
+    for sample in adata.obs['sample'].cat.categories:
+        if sample == '_multiplet':
+            continue
+        
+        adata_sample = adata[adata.obs['sample'] == sample].copy()
+        adata_sample.obs.index = [f'{b}_{sample}' for b in adata_sample.obs.index]
+        adatas[sample] = adata_sample
+    return adatas
+
+
+def barcode_to_sample_from_multiplexing_stats(
+    multiplexing_stats,
+    tag_to_sample,
+):
+    if isinstance(multiplexing_stats, str):
+        multiplexing_stats = pd.read_csv(multiplexing_stats, sep='\t', index_col=0)
+    
+    barcode_to_sample = dict()
+    for b, s, t in zip(
+        multiplexing_stats.index, 
+        multiplexing_stats['final_sample_tag'],
+        multiplexing_stats['type'],
+    ):
+        if str(s) in tag_to_sample:
+            if t == 'hq' or t == 'recovered':
+                barcode_to_sample[b] = tag_to_sample[str(s)]
+            elif t == 'multiplet':
+                barcode_to_sample[b] = '_multiplet'
+    
+    return barcode_to_sample
+
+
 def knee_plot(adata, ax=None):
     if ax is None:
         ax = plt.gca()
@@ -204,44 +258,82 @@ def combined_knee_and_cumulative_count_depth_plot(adata, ax=None, **kwargs):
     return ax, ax2
 
 
-def cell_cycle_genes(mouse_naming_scheme=True, source='tirosh', orthologs=None):
-    if source == 'tirosh':
-        s_genes = "MCM5;PCNA;TYMS;FEN1;MCM7;MCM4;RRM1;UNG;GINS2;MCM6;CDCA7;DTL;" \
-                  "PRIM1;UHRF1;CENPU;HELLS;RFC2;POLR1B;NASP;RAD51AP1;GMNN;WDR76;" \
-                  "SLBP;CCNE2;UBR7;POLD3;MSH2;ATAD2;RAD51;RRM2;CDC45;CDC6;EXO1;" \
-                  "TIPIN;DSCC1;BLM;CASP8AP2;USP1;CLSPN;POLA1;CHAF1B;MRPL36;E2F8".split(";")
-        g2m_genes = "HMGB2;CDK1;NUSAP1;UBE2C;BIRC5;TPX2;TOP2A;NDC80;CKS2;NUF2;" \
-                    "CKS1B;MKI67;TMPO;CENPF;TACC3;PIMREG;SMC4;CCNB2;CKAP2L;CKAP2;" \
-                    "AURKB;BUB1;KIF11;ANP32E;TUBB4B;GTSE1;KIF20B;HJURP;CDCA3;JPT1;" \
-                    "CDC20;TTK;CDC25C;KIF2C;RANGAP1;NCAPD2;DLGAP5;CDCA2;CDCA8;ECT2;" \
-                    "KIF23;HMMR;AURKA;PSRC1;ANLN;LBR;CKAP5;CENPE;CTCF;NEK2;G2E3;" \
-                    "GAS2L3;CBX5;CENPA".split(";")
-    elif source == 'macosko':
-        s_genes = 'ABCC5;ABHD10;ANKRD18A;ASF1B;ATAD2;BBS2;BIVM;BLM;BMI1;BRCA1;BRIP1;C5orf42;' \
-                  'C11orf82;CALD1;CALM2;CASP2;CCDC14;CCDC84;CCDC150;CDC7;CDC45;CDCA5;CDKN2AIP;' \
-                  'CENPM;CENPQ;CERS6;CHML;COQ9;CPNE8;CREBZF;CRLS1;DCAF16;DEPDC7;DHFR;DNA2;' \
-                  'DNAJB4;DONSON;DSCC1;DYNC1LI2;E2F8;EIF4EBP2;ENOSF1;ESCO2;EXO1;EZH2;FAM178A;' \
-                  'FANCA;FANCI;FEN1;GCLM;GOLGA8A;GOLGA8B;H1F0;HELLS;HIST1H2AC;HIST1H4C;INTS7;' \
-                  'KAT2A;KAT2B;KDELC1;KIAA1598;LMO4;LYRM7;MAN1A2;MAP3K2;MASTL;MBD4;MCM8;MLF1IP;' \
-                  'MYCBP2;NAB1;NEAT1;NFE2L2;NRD1;NSUN3;NT5DC1;NUP160;OGT;ORC3;OSGIN2;PHIP;PHTF1;' \
-                  'PHTF2;PKMYT1;POLA1;PRIM1;PTAR1;RAD18;RAD51;RAD51AP1;RBBP8;REEP1;RFC2;RHOBTB3;' \
-                  'RMI1;RPA2;RRM1;RRM2;RSRC2;SAP30BP;RANGAP1;RCCD1;RDH11;RNF141;SAP30;SKA3;SMC4;' \
-                  'STAT1;STIL;STK17B;SUCLG2;TFAP2A;TIMP1;SEPHS1;SETD8;SFPQ;SGOL2;SHCBP1;SMARCB1;' \
-                  'SMARCD1;SPAG5;SPTBN1;SRF;SRSF3;SS18;SUV420H1;TACC3;THRAP3;TLE3;TMEM138;TNPO1;' \
-                  'TOMM34;TPX2'.split(";")
+def cell_cycle_genes(organism, source=None, orthologs=None):
+    if organism in ('mm', 'hg'):
+        source = source or 'tirosh'
+        if source == 'tirosh':  # https://pubmed.ncbi.nlm.nih.gov/27124452/
+            s_genes = [
+                'MCM5', 'PCNA', 'TYMS', 'FEN1', 'MCM7', 'MCM4', 'RRM1', 'UNG', 'GINS2', 'MCM6', 'CDCA7', 'DTL',
+                'PRIM1', 'UHRF1', 'CENPU', 'HELLS', 'RFC2', 'POLR1B', 'NASP', 'RAD51AP1', 'GMNN', 'WDR76',
+                'SLBP', 'CCNE2', 'UBR7', 'POLD3', 'MSH2', 'ATAD2', 'RAD51', 'RRM2', 'CDC45', 'CDC6', 'EXO1',
+                'TIPIN', 'DSCC1', 'BLM', 'CASP8AP2', 'USP1', 'CLSPN', 'POLA1', 'CHAF1B', 'MRPL36', 'E2F8'
+            ]
+            g2m_genes = [
+                'HMGB2', 'CDK1', 'NUSAP1', 'UBE2C', 'BIRC5', 'TPX2', 'TOP2A', 'NDC80', 'CKS2', 'NUF2',
+                'CKS1B', 'MKI67', 'TMPO', 'CENPF', 'TACC3', 'PIMREG', 'SMC4', 'CCNB2', 'CKAP2L', 'CKAP2',
+                'AURKB', 'BUB1', 'KIF11', 'ANP32E', 'TUBB4B', 'GTSE1', 'KIF20B', 'HJURP', 'CDCA3', 'JPT1',
+                'CDC20', 'TTK', 'CDC25C', 'KIF2C', 'RANGAP1', 'NCAPD2', 'DLGAP5', 'CDCA2', 'CDCA8', 'ECT2',
+                'KIF23', 'HMMR', 'AURKA', 'PSRC1', 'ANLN', 'LBR', 'CKAP5', 'CENPE', 'CTCF', 'NEK2', 'G2E3',
+                'GAS2L3', 'CBX5', 'CENPA'
+            ]
+        elif source == 'macosko':  # https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4481139/
+            s_genes = [
+                'ABCC5', 'ABHD10', 'ANKRD18A', 'ASF1B', 'ATAD2', 'BBS2', 'BIVM', 'BLM', 'BMI1', 'BRCA1', 'BRIP1', 'C5orf42',
+                'C11orf82', 'CALD1', 'CALM2', 'CASP2', 'CCDC14', 'CCDC84', 'CCDC150', 'CDC7', 'CDC45', 'CDCA5', 'CDKN2AIP',
+                'CENPM', 'CENPQ', 'CERS6', 'CHML', 'COQ9', 'CPNE8', 'CREBZF', 'CRLS1', 'DCAF16', 'DEPDC7', 'DHFR', 'DNA2',
+                'DNAJB4', 'DONSON', 'DSCC1', 'DYNC1LI2', 'E2F8', 'EIF4EBP2', 'ENOSF1', 'ESCO2', 'EXO1', 'EZH2', 'FAM178A',
+                'FANCA', 'FANCI', 'FEN1', 'GCLM', 'GOLGA8A', 'GOLGA8B', 'H1F0', 'HELLS', 'HIST1H2AC', 'HIST1H4C', 'INTS7',
+                'KAT2A', 'KAT2B', 'KDELC1', 'KIAA1598', 'LMO4', 'LYRM7', 'MAN1A2', 'MAP3K2', 'MASTL', 'MBD4', 'MCM8', 'MLF1IP',
+                'MYCBP2', 'NAB1', 'NEAT1', 'NFE2L2', 'NRD1', 'NSUN3', 'NT5DC1', 'NUP160', 'OGT', 'ORC3', 'OSGIN2', 'PHIP', 'PHTF1',
+                'PHTF2', 'PKMYT1', 'POLA1', 'PRIM1', 'PTAR1', 'RAD18', 'RAD51', 'RAD51AP1', 'RBBP8', 'REEP1', 'RFC2', 'RHOBTB3',
+                'RMI1', 'RPA2', 'RRM1', 'RRM2', 'RSRC2', 'SAP30BP', 'RANGAP1', 'RCCD1', 'RDH11', 'RNF141', 'SAP30', 'SKA3', 'SMC4',
+                'STAT1', 'STIL', 'STK17B', 'SUCLG2', 'TFAP2A', 'TIMP1', 'SEPHS1', 'SETD8', 'SFPQ', 'SGOL2', 'SHCBP1', 'SMARCB1',
+                'SMARCD1', 'SPAG5', 'SPTBN1', 'SRF', 'SRSF3', 'SS18', 'SUV420H1', 'TACC3', 'THRAP3', 'TLE3', 'TMEM138', 'TNPO1',
+                'TOMM34', 'TPX2'
+            ]
 
-        g2m_genes = 'ANLN;AP3D1;ARHGAP19;ARL4A;ARMC1;ASXL1;ATL2;AURKB;BCLAF1;BORA;BRD8;BUB3;' \
-                    'C2orf69;C14orf80;CASP3;CBX5;CCDC107;CCNA2;CCNF;CDC16;CDC25C;CDCA2;CDCA3;' \
-                    'CDCA8;CDK1;CDKN1B;CDKN2C;CDR2;CENPL;CEP350;CFD;CFLAR;CHEK2;CKAP2;CKAP2L;' \
-                    'CYTH2;DCAF7;DHX8;DNAJB1;ENTPD5;ESPL1;FADD;FAM83D;FAN1;FANCD2;G2E3;GABPB1;' \
-                    'GAS1;GAS2L3;H2AFX;HAUS8;HINT3;HIPK2;HJURP;HMGB2;HN1;HP1BP3;HRSP12;IFNAR1;' \
-                    'IQGAP3;KATNA1;KCTD9;KDM4A;KIAA1524;KIF5B;KIF11;KIF20B;KIF22;KIF23;KIFC1;' \
-                    'KLF6;KPNA2;LBR;LIX1L;LMNB1;MAD2L1;MALAT1;MELK;MGAT2;MID1;MIS18BP1;MND1;NCAPD3' \
-                    ';NCAPH;NCOA5;NDC80;NEIL3;NFIC;NIPBL;NMB;NR3C1;NUCKS1;NUMA1;NUSAP1;PIF1;' \
-                    'PKNOX1;POLQ;PPP1R2;PSMD11;PSRC1;PTP4A1;PTPN9;PWP1;QRICH1;RAD51C;RANGAP1;' \
-                    'RBM8A;RCAN1;RERE;RNF126;RNF141;RNPS1;RRP1'.split(";")
-    else:
-        raise ValueError(f"Unknown source '{source}', use 'tirosh' or 'macosko' instead")
+            g2m_genes = [
+                'ANLN', 'AP3D1', 'ARHGAP19', 'ARL4A', 'ARMC1', 'ASXL1', 'ATL2', 'AURKB', 'BCLAF1', 'BORA', 'BRD8', 'BUB3',
+                'C2orf69', 'C14orf80', 'CASP3', 'CBX5', 'CCDC107', 'CCNA2', 'CCNF', 'CDC16', 'CDC25C', 'CDCA2', 'CDCA3',
+                'CDCA8', 'CDK1', 'CDKN1B', 'CDKN2C', 'CDR2', 'CENPL', 'CEP350', 'CFD', 'CFLAR', 'CHEK2', 'CKAP2', 'CKAP2L',
+                'CYTH2', 'DCAF7', 'DHX8', 'DNAJB1', 'ENTPD5', 'ESPL1', 'FADD', 'FAM83D', 'FAN1', 'FANCD2', 'G2E3', 'GABPB1',
+                'GAS1', 'GAS2L3', 'H2AFX', 'HAUS8', 'HINT3', 'HIPK2', 'HJURP', 'HMGB2', 'HN1', 'HP1BP3', 'HRSP12', 'IFNAR1',
+                'IQGAP3', 'KATNA1', 'KCTD9', 'KDM4A', 'KIAA1524', 'KIF5B', 'KIF11', 'KIF20B', 'KIF22', 'KIF23', 'KIFC1',
+                'KLF6', 'KPNA2', 'LBR', 'LIX1L', 'LMNB1', 'MAD2L1', 'MALAT1', 'MELK', 'MGAT2', 'MID1', 'MIS18BP1', 'MND1', 'NCAPD3',
+                'NCAPH', 'NCOA5', 'NDC80', 'NEIL3', 'NFIC', 'NIPBL', 'NMB', 'NR3C1', 'NUCKS1', 'NUMA1', 'NUSAP1', 'PIF1',
+                'PKNOX1', 'POLQ', 'PPP1R2', 'PSMD11', 'PSRC1', 'PTP4A1', 'PTPN9', 'PWP1', 'QRICH1', 'RAD51C', 'RANGAP1',
+                'RBM8A', 'RCAN1', 'RERE', 'RNF126', 'RNF141', 'RNPS1', 'RRP1'
+            ]
+        else:
+            raise ValueError(f"Unknown source '{source}', use 'tirosh' or 'macosko' instead")
+
+        if orthologs is None and organism == 'mm':
+            s_genes = [g.lower().capitalize() for g in s_genes]
+            g2m_genes = [g.lower().capitalize() for g in g2m_genes]
+        
+    elif organism == 'zf':
+        source = source or 'brand'
+        if source == 'brand':  # https://elifesciences.org/articles/86507
+            s_genes = [
+                'mcm5', 'pcna', 'tyms', 'fen1', 'mcm2', 'mcm4', 'rrm1', 'unga', 
+                'gins2', 'mcm6', 'cdca7a', 'dtl', 'prim1', 'uhrf1', 'si:dkey-185e18.7', 
+                'hells', 'rfc2', 'rpa2', 'nasp', 'rad51ap1', 'gmnn', 'wdr76', 'slbp', 
+                'ccne2', 'ubr7', 'pold3', 'msh2', 'atad2', 'rad51', 'rrm2', 'cdc45', 
+                'cdc6', 'exo1', 'tipin', 'dscc1', 'blm', 
+                'casp8ap2', 'usp1', 'pola1', 'chaf1b', 'brip1', 'e2f8'
+            ]
+            g2m_genes = [
+                'hmgb2a', 'cdk1', 'nusap1', 'ube2c', 'birc5a', 'tpx2', 'top2a', 
+                'ndc80', 'cks2', 'nuf2', 'cks1b', 'mki67', 'tmpoa', 'cenpf', 
+                'tacc3', 'smc4', 'ccnb2', 'ckap2l', 'aurkb', 'bub1', 'kif11', 
+                'anp32e', 'tubb4b', 'gtse1', 'kif20ba', 'si:ch211-69g19.2', 
+                'jpt1a', 'cdc20', 'ttk', 'kif2c', 'rangap1a', 'ncapd2', 'dlgap5', 
+                'si:ch211-244o22.2', 'cdca8', 'ect2', 'kif23', 'hmmr', 'aurka', 
+                'anln', 'lbr', 'ckap5', 'cenpe', 'ctcf', 'nek2', 'g2e3', 'gas2l3', 
+                'cbx5', 'selenoh'
+            ]
+        else:
+            raise ValueError(f"Unknown source '{source}', use 'brand' for zebrafish")
 
     if orthologs is not None:
         if isinstance(orthologs, string_types):
@@ -249,23 +341,21 @@ def cell_cycle_genes(mouse_naming_scheme=True, source='tirosh', orthologs=None):
 
         s_genes = [orthologs.get(g, g) for g in s_genes]
         g2m_genes = [orthologs.get(g, g) for g in g2m_genes]
-    else:
-        if mouse_naming_scheme:
-            s_genes = [g.lower().capitalize() for g in s_genes]
-            g2m_genes = [g.lower().capitalize() for g in g2m_genes]
 
     return s_genes, g2m_genes
 
 
-def activation_score_genes_marsh_et_al(mouse_naming_scheme=True, orthologs=None):
-    if mouse_naming_scheme:
+def activation_score_genes_marsh_et_al(organism='hg', orthologs=None):
+    if organism == 'mm':
         genes = ['Fos', 'Junb', 'Zfp36', 'Jun', 'Hspa1a', 'Socs3', 'Rgs1', 'Egr1', 'Btg2', 
                 'Fosb', 'Hist1h1d', 'Ier5', '1500015O10Rik', 'Atf3', 'Hist1h2ac', 
                 'Dusp1', 'Hist1h1e', 'Folr1', 'Serpine1']
-    else:
+    elif organism == 'hg':
         genes = ['FOS', 'JUNB', 'ZFP36', 'JUN', 'HSPA1B', 'SOCS3', 'RGS1', 'EGR1', 'BTG2', 
                  'FOSB', 'HIST1H1D', 'IER5', '1500015O10Rik', 'ATF3', 'HIST1H2AC', 
                  'DUSP1', 'HIST1H1E', 'FOLR1', 'SERPINE1']
+    else:
+        raise ValueError("Unknown organism '{organism}' (mm, hg)")
     
     if orthologs is not None:
         if isinstance(orthologs, string_types):
@@ -324,7 +414,7 @@ def annotate_base_stats(adata, doublets=True, mitochondrial=True, mitochondrial_
 
     if cell_cycle:
         s_genes, g2m_genes = cell_cycle_genes(
-            mouse_naming_scheme=genome.startswith('mm'), 
+            organism=genome, 
             orthologs=orthologs
         )
         s_genes_mm_ens = adata.var_names[np.in1d(adata.var_names, s_genes)]
@@ -333,7 +423,7 @@ def annotate_base_stats(adata, doublets=True, mitochondrial=True, mitochondrial_
     
     if activation_score:
         stress_activation_genes = activation_score_genes_marsh_et_al(
-            mouse_naming_scheme=genome.startswith('mm'), 
+            organism=genome, 
             orthologs=orthologs
         )
         stress_activation_genes_ens = adata.var_names[np.in1d(adata.var_names, stress_activation_genes)]
@@ -390,31 +480,22 @@ def scran_norm(
 ):
     logger.debug("Running scran norm")
     
-    print('A')
     adata_pp = adata.copy()
     if layer is not None:
         adata_pp.X = adata_pp.layers[layer]
 
     logger.debug("Scran preprocessing")
-    print('B')
     sc.pp.normalize_per_cell(adata_pp, counts_per_cell_after=1e6)
-    print('B1')
     sc.pp.log1p(adata_pp)
-    print('B2')
     sc.pp.pca(adata_pp, n_comps=min(15, adata_pp.shape[0] - 1))
-    print('B3')
     sc.pp.neighbors(adata_pp)
-    print('B4')
     sc.tl.leiden(adata_pp, key_added='groups', resolution=resolution)
-    print('B5')
     
-    print('C')
     logger.debug("Scran cluster optimisation")
     adata_pp.obs['groups'] = _optimise_scran_clusters(adata_pp, adata_pp.obs['groups'], min_group_size=min_count)
 
     input_groups = adata_pp.obs['groups']
 
-    print('D')
     logger.info("Number of different groups passed to scran: {}".format(input_groups.dtype.categories))
     if layer is None:
         data_mat = adata.X.toarray().T

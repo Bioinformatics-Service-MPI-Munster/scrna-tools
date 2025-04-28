@@ -2,8 +2,10 @@ import os
 import regex as re
 from future.utils import string_types
 from ..helpers import smart_open, mkdir
+from ._whitelist_correction import correct_rhapsody_barcode
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 from collections import defaultdict
 import logging
 
@@ -50,6 +52,15 @@ SAMPLE_TAGS = {
         'CGCGTCCAATTTCCGAAGCCCCGCCCTAGGAGTTCCCCTGCGTGC',
         'GCCCATTCATTGCACCCGCCAGTGATCGACCCTAGTGGAGCTAAG',
     ]
+}
+
+barcode_res = {
+    'legacy': re.compile(
+        '(?P<barcode>.{9}ACTGGCCTGCGA.{9}GGTAGCGGTGACA.{9}){{e<=2}}'
+    ),
+    'enhanced': re.compile(
+        '(?P<barcode>.{9}GTGA.{9}GACA.{9})'
+    ),
 }
 
 
@@ -254,75 +265,141 @@ def rhapsody_extract_barcodes(fastq_1_file, output_1_file,
     return total, valid
 
 
-def rhapsody_demultiplex(barcodes_file, reads_file, genome, output_folder=None, prefix='sample',
-                         sample_names=None, common_mismatches=2, hq_singlet_cutoff=0.75,
-                         expected_noise_plot=None, sample_tag_counts_plot=None):
-    if sample_names is None:
-        sample_names = {1: '1', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6',
-                        7: '7', 8: '8', 9: '9', 10: '10', 11: '11', 12: '12'}
+def rhapsody_demultiplex(
+    barcodes_files, 
+    reads_files, 
+    genome, 
+    output_folder=None, 
+    prefix='sample',
+    mismatches=2, 
+    hq_singlet_cutoff=0.75,
+    expected_noise_plot=None, 
+    sample_tag_counts_plot=None,
+    statistics_file=None,
+    barcode_version='enhanced',
+    whitelists=None,
+):
+    if isinstance(barcodes_files, string_types):
+        barcodes_files = [barcodes_files]
+    
+    if isinstance(reads_files, string_types):
+        reads_files = [reads_files]
+    
+    if len(barcodes_files) != len(reads_files):
+        raise ValueError("Number of barcode files does not match number of reads files.")
+    
+    sample_tags = SAMPLE_TAGS[genome]
+    
+    sample_tag_option_string = "(" + ")|(".join(sample_tags) + ")"
+    sample_tag_re = re.compile(
+        "(GTTGTCAAGATGCTACCGTTCAGAG){{e<={mismatches}}}"
+        "(?P<sample_tag>{sample_tag_option_string}){{e<={mismatches}}}"
+        "AAA*".format(
+            mismatches=mismatches,
+            sample_tag_option_string=sample_tag_option_string,
+        )
+    )
+    
+    barcode_re = barcode_res[barcode_version]
+    
+    barcode_matches = 0
+    barcode_matches_with_sample_tag = 0
+    cell_sample_tags = defaultdict(lambda: np.array([0] * len(sample_tags), dtype=int))
+    
+    for barcodes_file, reads_file in zip(barcodes_files, reads_files):
+        if not os.path.exists(barcodes_file):
+            raise ValueError("Barcodes file {} does not exist.".format(barcodes_file))
+        if not os.path.exists(reads_file):
+            raise ValueError("Reads file {} does not exist.".format(reads_file))
+    
+        # start demultiplexing
+        with smart_open(barcodes_file, 'rb') as f:
+            logger.info("Determining file size...")
+            n_lines = int(sum(1 for _ in f))
 
-    # compile regex
-    sample_tag_re = re.compile("(GTTGTCAAGATGCTACCGTTCAGAG){{e<={common_mismatches}}}"
-                                "(?P<sample_tag>.{{45}})"
-                                "AAA*".format(common_mismatches=common_mismatches))
-    sample_tags = {}
-    sample_tag_to_ix = {}
-    sample_ix_to_tag = {}
-    for i, (sample_tag_ix, sample_name) in enumerate(sample_names.items()):
-        sample_tag = SAMPLE_TAGS[genome[:2]][int(sample_tag_ix) - 1]
-        sample_tags[sample_tag] = sample_name
-        sample_tag_to_ix[sample_tag] = i
-        sample_ix_to_tag[i] = sample_tag
+        with smart_open(barcodes_file, 'rb') as file1:
+            with smart_open(reads_file, 'rb') as file2:
+                try:
+                    file1_iter = iter(file1)
+                    file2_iter = iter(file2)
 
-    sample_tags_correct = BarcodeCorrect(sample_tag_to_ix.keys())
+                    i = 0
+                    with tqdm(total=n_lines, desc='DMX') as pb:
+                        while True:
+                            line1 = next(file1_iter).decode('utf-8').rstrip()
+                            line2 = next(file2_iter).decode('utf-8').rstrip()
+                            
+                            if i % 4 == 1:
+                                barcode_match = barcode_re.search(line1)
+                                if barcode_match is not None:
+                                    barcode_tmp = barcode_match.group(0)
+                                    if barcode_version == 'enhanced':
+                                        barcode = f'{barcode_tmp[:9]}_{barcode_tmp[13:22]}_{barcode_tmp[26:]}'
+                                    else:
+                                        barcode = f'{barcode_tmp[:9]}_{barcode_tmp[21:30]}_{barcode_tmp[43:]}'
+                                    barcode_matches += 1
+                                    
+                                    sample_tag_match = sample_tag_re.match(line2)
+                                    if sample_tag_match is not None:
+                                        sample_tag_ix = None
+                                        for ix, group in enumerate(sample_tag_match.groups()[2:]):
+                                            if group is not None:
+                                                sample_tag_ix = ix
+                                                break
+                                        cell_sample_tags[barcode][sample_tag_ix] += 1
+                                        barcode_matches_with_sample_tag += 1
+                            
+                            pb.update()
+                            i += 1
+                except StopIteration:
+                    pass
 
-    # start demultiplexing
-    with smart_open(barcodes_file, 'rb') as f:
-        logger.info("Determining file size...")
-        n_lines = int(sum(1 for _ in f))
-
-    cell_sample_tags = defaultdict(lambda: np.array([0] * len(sample_names)))
-    with smart_open(barcodes_file, 'rb') as file1:
-        with smart_open(reads_file, 'rb') as file2:
-            try:
-                file1_iter = iter(file1)
-                file2_iter = iter(file2)
-
-                i = 0
-                with tqdm(total=n_lines, desc='DMX') as pb:
-                    while True:
-                        line1 = next(file1_iter).decode('utf-8').rstrip()
-                        line2 = next(file2_iter).decode('utf-8').rstrip()
-
-                        if i % 4 == 1:
-                            barcode = line1[:27]
-                            m = sample_tag_re.match(line2)
-                            if m is not None:
-                                sample_tag = m.group(2)
-                                sample_tag_candidates = sample_tags_correct.candidates(sample_tag)
-                                if sample_tag_candidates is not None and len(sample_tag_candidates) == 1:
-                                    ix = sample_tag_to_ix.get(sample_tag_candidates.pop(), None)
-                                    if ix is not None:
-                                        cell_sample_tags[barcode][ix] += 1
-
-                        i += 1
-                        pb.update(1)
-            except StopIteration:
-                pass
-
+    print("Barcodes detected: ", barcode_matches)
+    print("Barcodes with sample tag: ", barcode_matches_with_sample_tag)
+    
+    if whitelists is not None:
+        n_failures = 0
+        cell_sample_tags_corrected = defaultdict(lambda: np.array([0] * len(sample_tags)))
+        for barcode, counts in tqdm(cell_sample_tags.items(), desc='Correcting barcodes'):
+            corrected_barcode = correct_rhapsody_barcode(barcode, *whitelists)
+            if corrected_barcode is not None:
+                cell_sample_tags_corrected[corrected_barcode] += counts
+            else:
+                n_failures += 1
+                cell_sample_tags_corrected[barcode] += counts
+        print("Barcode correction failures: ", n_failures)
+        cell_sample_tags = cell_sample_tags_corrected
+    
+    sample_tag_statistics = pd.DataFrame(
+        [
+            list(counts) + [sum(counts)]
+            for counts in cell_sample_tags.values()
+        ],
+        columns=['sample_tag_{}'.format(i + 1) for i in range(len(sample_tags))] + ['total'],
+        index=[barcode for barcode in cell_sample_tags.keys()],
+    )
+    sample_tag_statistics['final_sample_tag'] = -1
+    sample_tag_statistics['type'] = pd.Categorical(
+        ['undetermined'] * sample_tag_statistics.shape[0],
+        categories=['undetermined', 'hq', 'recovered', 'multiplet'],
+    )
+    
+    print("Identifying high quality singlets...")
     hq = 0
     cell_samples = dict()
     # identify high quality singlets
     lq_cell_sample_tags = {}
-    sample_tags_hq_counts = [[] for _ in range(len(sample_names))]
-    sample_tags_noise_counts = [[] for _ in range(len(sample_names))]
+    sample_tags_hq_counts = [[] for _ in range(len(sample_tags))]
+    sample_tags_noise_counts = [[] for _ in range(len(sample_tags))]
     total_noise = 0
-    for barcode, counts in cell_sample_tags.items():
+    for barcode, counts in tqdm(cell_sample_tags.items()):
         fractions = counts / sum(counts)
         hq_ixs = np.where(fractions > hq_singlet_cutoff)[0]
         if len(hq_ixs) == 1:
             hq_ix = hq_ixs[0]
             cell_samples[barcode] = hq_ix
+            sample_tag_statistics.loc[barcode, 'final_sample_tag'] = hq_ix
+            sample_tag_statistics.loc[barcode, 'type'] = 'hq'
             hq_count = counts[hq_ix]
             hq += 1
             noise_count = np.sum(np.delete(counts, hq_ixs))
@@ -336,6 +413,7 @@ def rhapsody_demultiplex(barcodes_file, reads_file, genome, output_folder=None, 
                                     for counts in sample_tags_hq_counts]
     percentage_noise = [sum(noise)/total_noise for noise in sample_tags_noise_counts]
 
+    print("Plotting sample tag counts...")
     if sample_tag_counts_plot is not None:
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
@@ -343,16 +421,16 @@ def rhapsody_demultiplex(barcodes_file, reads_file, genome, output_folder=None, 
         gs = GridSpec(4, 3)
         for i in range(len(sample_tags_hq_counts)):
             counts = sample_tags_hq_counts[i]
-            sample_tag = sample_ix_to_tag[i]
-            sample_name = sample_tags[sample_tag]
             ax = plt.subplot(gs[int(i / 3), i % 3])
             ax.hist(counts, bins=100)
             ax.set_xlabel("Sample Tag read count")
             ax.set_ylabel("Number of putative cells")
-            ax.set_title(sample_name)
+            ax.set_yscale('log')
+            ax.set_title(f'Tag {i + 1}')
         fig.tight_layout()
         fig.savefig(sample_tag_counts_plot)
 
+    print("Fitting expected noise trendline...")
     # fit expected noise trendline
     per_cell_tag_counts = []
     per_cell_total_counts = []
@@ -381,7 +459,7 @@ def rhapsody_demultiplex(barcodes_file, reads_file, genome, output_folder=None, 
 
     multiplets = 0
     undetermined = 0
-    unique = 0
+    recovered = 0
     for barcode, counts in lq_cell_sample_tags.items():
         total = np.sum(counts)
         expected_noise = m * total + b
@@ -392,77 +470,100 @@ def rhapsody_demultiplex(barcodes_file, reads_file, genome, output_folder=None, 
                 ixs.append(i)
 
         if len(ixs) == 1:
+            recovered += 1
             cell_samples[barcode] = ixs[0]
+            sample_tag_statistics.loc[barcode, 'final_sample_tag'] = ixs[0]
+            sample_tag_statistics.loc[barcode, 'type'] = 'recovered'
         elif len(ixs) > 1:
             multiplets += 1
+            sample_tag_statistics.loc[barcode, 'type'] = 'multiplet'
         else:
             undetermined += 1
 
     logger.info("HQ: {}".format(hq))
-    logger.info("Recovered: {}".format(unique))
+    logger.info("Recovered: {}".format(recovered))
     logger.info("Multiplets: {}".format(multiplets))
     logger.info("Undetermined: {}".format(undetermined))
 
-    cell_sample_names = {barcode: sample_tags[sample_ix_to_tag[ix]] for barcode, ix in cell_samples.items()}
+    # fix for natural numbering
+    sample_tag_statistics['final_sample_tag'] += 1
 
+    if statistics_file is not None:
+        sample_tag_statistics.to_csv(statistics_file, sep="\t")
+    
     if output_folder is None:
-        return cell_sample_names
+        return cell_samples, None
 
     output_folder = mkdir(output_folder)
     output_files = {}
     output_file_names = {}
+    
     try:
-        with smart_open(barcodes_file, 'rb') as file1:
-            with smart_open(reads_file, 'rb') as file2:
-                try:
-                    file1_iter = iter(file1)
-                    file2_iter = iter(file2)
+        for barcodes_file, reads_file in zip(barcodes_files, reads_files):
+            with smart_open(barcodes_file, 'rb') as file1:
+                with smart_open(reads_file, 'rb') as file2:
+                    try:
+                        file1_iter = iter(file1)
+                        file2_iter = iter(file2)
 
-                    i = 0
-                    current_sample_name = None
-                    current_entry1 = [None, None, None, None]
-                    current_entry2 = [None, None, None, None]
-                    with tqdm(total=n_lines, desc='DMX-Split') as pb:
-                        while True:
-                            line1 = next(file1_iter).decode('utf-8').rstrip()
-                            line2 = next(file2_iter).decode('utf-8').rstrip()
+                        i = 0
+                        current_sample_name = -1
+                        current_entry1 = [None, None, None, None]
+                        current_entry2 = [None, None, None, None]
+                        with tqdm(total=n_lines, desc='DMX-Split') as pb:
+                            while True:
+                                line1 = next(file1_iter).decode('utf-8').rstrip()
+                                line2 = next(file2_iter).decode('utf-8').rstrip()
 
-                            current_entry1[i % 4] = line1
-                            current_entry2[i % 4] = line2
+                                current_entry1[i % 4] = line1
+                                current_entry2[i % 4] = line2
 
-                            if i % 4 == 1:
-                                barcode = line1[:27]
-                                current_sample_name = cell_sample_names.get(barcode, None)
+                                if i % 4 == 1:
+                                    barcode_match = barcode_re.search(line1)
+                                    if barcode_match is not None:
+                                        barcode_tmp = barcode_match.group(0)
+                                        if barcode_version == 'enhanced':
+                                            barcode = f'{barcode_tmp[:9]}_{barcode_tmp[13:22]}_{barcode_tmp[26:]}'
+                                        else:
+                                            barcode = f'{barcode_tmp[:9]}_{barcode_tmp[21:30]}_{barcode_tmp[43:]}'
+                                        
+                                        barcode = correct_rhapsody_barcode(barcode, *whitelists) or barcode
+                                        
+                                        current_sample_name = cell_samples.get(barcode, -1)
+                                    else:
+                                        current_sample_name = -1
 
-                            if i % 4 == 0 and current_sample_name is not None:
-                                if current_sample_name in output_files:
-                                    f1, f2 = output_files[current_sample_name]
-                                else:
-                                    file1_name = os.path.join(output_folder,
-                                                                '{}_{}_R1.fastq.gz'.format(prefix,
-                                                                                            current_sample_name))
-                                    file2_name = os.path.join(output_folder,
-                                                                '{}_{}_R2.fastq.gz'.format(prefix,
-                                                                                            current_sample_name))
-                                    output_file_names[current_sample_name] = (file1_name, file2_name)
-                                    f1 = smart_open(file1_name, 'wb')
-                                    f2 = smart_open(file2_name, 'wb')
-                                    output_files[current_sample_name] = (f1, f2)
+                                if i % 4 == 3:
+                                    if current_sample_name in output_files:
+                                        f1, f2 = output_files[current_sample_name]
+                                    else:
+                                        file1_name = os.path.join(
+                                            output_folder,
+                                            '{}_{}_R1.fastq.gz'.format(prefix, current_sample_name + 1)
+                                        )
+                                        file2_name = os.path.join(
+                                            output_folder,
+                                            '{}_{}_R2.fastq.gz'.format(prefix, current_sample_name + 1)
+                                        )
+                                        output_file_names[current_sample_name] = (file1_name, file2_name)
+                                        f1 = smart_open(file1_name, 'wb')
+                                        f2 = smart_open(file2_name, 'wb')
+                                        output_files[current_sample_name] = (f1, f2)
 
-                                for line in current_entry1:
-                                    f1.write("{}\n".format(line).encode('utf-8'))
-                                for line in current_entry2:
-                                    f2.write("{}\n".format(line).encode('utf-8'))
-                                current_sample_name = None
+                                    for line in current_entry1:
+                                        f1.write("{}\n".format(line).encode('utf-8'))
+                                    for line in current_entry2:
+                                        f2.write("{}\n".format(line).encode('utf-8'))
+                                    current_sample_name = None
 
-                            i += 1
-                            pb.update()
-                except StopIteration:
-                    pass
+                                i += 1
+                                pb.update()
+                    except StopIteration:
+                        pass
     finally:
         for f1, f2 in output_files.values():
             f1.close()
             f2.close()
 
-    return cell_sample_names, output_file_names
+    return cell_samples, output_file_names
 
