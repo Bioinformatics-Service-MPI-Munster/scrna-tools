@@ -138,6 +138,7 @@ def relayout(
     umap=True, 
     tsne=True, 
     fdl=False, 
+    diffmap=False,
     use_batch_for_hvg=True,
     hvg=True, 
     scale=False, 
@@ -196,6 +197,9 @@ def relayout(
         integrated_key = 'X_pca'
 
     logger.info("Calculating neighbors")
+    # Gotta fix a scanpy quirk in the Neighbors class init:
+    if 'X_diffmap' in adata.obsm:
+        del adata.obsm['X_diffmap']
     sc.pp.neighbors(adata, n_pcs=n_pcs, use_rep=integrated_key, knn=True, n_neighbors=n_neighbors)
     neighbors_key = 'neighbors' if key_prefix is None else f'{key_prefix}_neighbors'
     connectivities_key = 'connectivities' if key_prefix is None else f'{key_prefix}_connectivities'
@@ -222,6 +226,12 @@ def relayout(
         logger.info("Calculating tSNE")
         sc.tl.tsne(adata, use_rep=integrated_key)
         adata_original.obsm['X_tsne' if key_prefix is None else f'X_{key_prefix}_tsne'] = adata.obsm['X_tsne']
+
+    if diffmap:
+        logger.info("Calculating DiffMap")
+        sc.tl.diffmap(adata)
+        adata_original.obsm['X_diffmap' if key_prefix is None else f'X_{key_prefix}_diffmap'] = adata.obsm['X_diffmap']
+        adata_original.uns['diffmap_evals' if key_prefix is None else f'{key_prefix}_diffmap_evals'] = adata.uns['diffmap_evals']
 
     if fdl:
         if has_harmony and has_palantir:
@@ -1072,6 +1082,7 @@ def paga(
     vdata,
     paga_key,
     obs_key,
+    obs_categories=None,
     neighbors_key=None,
     obsm_key=None,
     do_relayout=False, 
@@ -1089,6 +1100,12 @@ def paga(
         adata_sub = vdata.restore_view(restore_view)
     else:
         adata_sub = vdata.adata_view
+    
+    if obs_categories is not None:
+        from ._core._vdata import VData
+        vdata_sub = VData(adata_sub)
+        vdata_sub.add_categorical_obs_constraint(obs_key, obs_categories)
+        adata_sub = vdata_sub.adata_view
     
     if do_relayout:
         relayout_kwargs.setdefault('umap', False)
